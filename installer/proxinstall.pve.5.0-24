@@ -1,0 +1,3223 @@
+#!/usr/bin/perl
+
+$ENV{DEBIAN_FRONTEND} = 'noninteractive';
+$ENV{LC_ALL} = 'C';
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use IPC::Open2;
+use IPC::Open3;
+use IO::File;
+use IO::Select;
+use Cwd 'abs_path';
+use Gtk3 '-init';
+use Gtk3::WebKit;
+use Encode;
+use String::ShellQuote;
+use Data::Dumper;
+use File::Basename;
+use Time::HiRes;
+
+use ProxmoxInstallerSetup;
+
+my $setup = ProxmoxInstallerSetup::setup();
+
+my $opt_testmode;
+
+if (!$ENV{G_SLICE} ||  $ENV{G_SLICE} ne "always-malloc") {
+    die "do not use slice allocator (run with 'G_SLICE=always-malloc ./proxinstall ...')\n";
+}
+
+if (!GetOptions('testmode=s' => \$opt_testmode)) {
+    die "usage error\n";
+    exit (-1);
+}
+
+my $zfstestpool = "test_rpool";
+my $zfspoolname = $opt_testmode ? $zfstestpool : 'rpool';
+my $zfsrootvolname = "$setup->{product}-1";
+
+my $storage_cfg_zfs = <<__EOD__;
+dir: local
+	path /var/lib/vz
+	content iso,vztmpl,backup
+
+zfspool: local-zfs
+	pool $zfspoolname/data
+	sparse
+	content images,rootdir
+__EOD__
+
+my $storage_cfg_btrfs = <<__EOD__;
+dir: local
+	path /var/lib/vz
+	content iso,vztmpl,backup
+	disabled
+
+btrfs: local-btrfs
+	path /var/lib/pve/local-btrfs
+	content iso,vztmpl,backup,images,rootdir
+__EOD__
+
+my $storage_cfg_lvmthin = <<__EOD__;
+dir: local
+	path /var/lib/vz
+	content iso,vztmpl,backup
+
+lvmthin: local-lvm
+	thinpool data
+	vgname pve
+	content rootdir,images
+__EOD__
+
+my $storage_cfg_local = <<__EOD__;
+dir: local
+	path /var/lib/vz
+	content iso,vztmpl,backup,rootdir,images
+__EOD__
+
+sub file_read_firstline {
+    my ($filename) = @_;
+
+    my $fh = IO::File->new ($filename, "r");
+    return undef if !$fh;
+    my $res = <$fh>;
+    chomp $res if $res;
+    $fh->close;
+    return $res;
+}
+
+my $logfd = IO::File->new(">/tmp/install.log");
+
+my $proxmox_libdir = $opt_testmode ?
+    Cwd::cwd() . "/testdir/var/lib/pve-installer" : "/var/lib/pve-installer";
+my $proxmox_cddir = $opt_testmode ? "../pve-cd-builder/tmp/data-gz/" : "/cdrom";
+my $proxmox_pkgdir = "${proxmox_cddir}/proxmox/packages/";
+
+my $grub_plattform = "pc"; # pc, efi-amd64 or efi-ia32
+
+$grub_plattform = "efi-amd64" if -d "/sys/firmware/efi";
+
+my $IPV4OCTET = "(?:25[0-5]|(?:2[0-4]|1[0-9]|[1-9])?[0-9])";
+my $IPV4RE = "(?:(?:$IPV4OCTET\\.){3}$IPV4OCTET)";
+my $IPV6H16 = "(?:[0-9a-fA-F]{1,4})";
+my $IPV6LS32 = "(?:(?:$IPV4RE|$IPV6H16:$IPV6H16))";
+
+my $IPV6RE = "(?:" .
+    "(?:(?:" .                             "(?:$IPV6H16:){6})$IPV6LS32)|" .
+    "(?:(?:" .                           "::(?:$IPV6H16:){5})$IPV6LS32)|" .
+    "(?:(?:(?:" .              "$IPV6H16)?::(?:$IPV6H16:){4})$IPV6LS32)|" .
+    "(?:(?:(?:(?:$IPV6H16:){0,1}$IPV6H16)?::(?:$IPV6H16:){3})$IPV6LS32)|" .
+    "(?:(?:(?:(?:$IPV6H16:){0,2}$IPV6H16)?::(?:$IPV6H16:){2})$IPV6LS32)|" .
+    "(?:(?:(?:(?:$IPV6H16:){0,3}$IPV6H16)?::(?:$IPV6H16:){1})$IPV6LS32)|" .
+    "(?:(?:(?:(?:$IPV6H16:){0,4}$IPV6H16)?::" .           ")$IPV6LS32)|" .
+    "(?:(?:(?:(?:$IPV6H16:){0,5}$IPV6H16)?::" .            ")$IPV6H16)|" .
+    "(?:(?:(?:(?:$IPV6H16:){0,6}$IPV6H16)?::" .                    ")))";
+
+my $IPRE = "(?:$IPV4RE|$IPV6RE)";
+
+
+my $ipv4_mask_hash = {
+    '128.0.0.0' => 1,
+    '192.0.0.0' => 2,
+    '224.0.0.0' => 3,
+    '240.0.0.0' => 4,
+    '248.0.0.0' => 5,
+    '252.0.0.0' => 6,
+    '254.0.0.0' => 7,
+    '255.0.0.0' => 8,
+    '255.128.0.0' => 9,
+    '255.192.0.0' => 10,
+    '255.224.0.0' => 11,
+    '255.240.0.0' => 12,
+    '255.248.0.0' => 13,
+    '255.252.0.0' => 14,
+    '255.254.0.0' => 15,
+    '255.255.0.0' => 16,
+    '255.255.128.0' => 17,
+    '255.255.192.0' => 18,
+    '255.255.224.0' => 19,
+    '255.255.240.0' => 20,
+    '255.255.248.0' => 21,
+    '255.255.252.0' => 22,
+    '255.255.254.0' => 23,
+    '255.255.255.0' => 24,
+    '255.255.255.128' => 25,
+    '255.255.255.192' => 26,
+    '255.255.255.224' => 27,
+    '255.255.255.240' => 28,
+    '255.255.255.248' => 29,
+    '255.255.255.252' => 30,
+    '255.255.255.254' => 31,
+    '255.255.255.255' => 32
+};
+
+my $ipv4_reverse_mask = [
+    '0.0.0.0',
+    '128.0.0.0',
+    '192.0.0.0',
+    '224.0.0.0',
+    '240.0.0.0',
+    '248.0.0.0',
+    '252.0.0.0',
+    '254.0.0.0',
+    '255.0.0.0',
+    '255.128.0.0',
+    '255.192.0.0',
+    '255.224.0.0',
+    '255.240.0.0',
+    '255.248.0.0',
+    '255.252.0.0',
+    '255.254.0.0',
+    '255.255.0.0',
+    '255.255.128.0',
+    '255.255.192.0',
+    '255.255.224.0',
+    '255.255.240.0',
+    '255.255.248.0',
+    '255.255.252.0',
+    '255.255.254.0',
+    '255.255.255.0',
+    '255.255.255.128',
+    '255.255.255.192',
+    '255.255.255.224',
+    '255.255.255.240',
+    '255.255.255.248',
+    '255.255.255.252',
+    '255.255.255.254',
+    '255.255.255.255',
+];
+
+my $step_number = 0; # Init number for global function list
+
+my @steps = (
+    {
+	step => 'intro',
+	html => 'license.htm',
+	next_button => 'I a_gree',
+	function => \&create_intro_view,
+    },
+    {
+	step => 'intro',
+	html => 'page1.htm',
+	function => \&create_hdsel_view,
+    },
+    {
+	step => 'country',
+	html => 'country.htm',
+	function => \&create_country_view,
+    },
+    {
+	step => 'password',
+	html => 'passwd.htm',
+	function => \&create_password_view,
+    },
+    {
+	step => 'ipconf',
+	html => 'ipconf.htm',
+	function => \&create_ipconf_view,
+    },
+    {
+	step => 'ack',
+	html => 'ack.htm',
+	next_button => '_Install',
+	function => \&create_ack_view,
+    },
+    {
+	step => 'extract',
+	next_button => '_Reboot',
+	function => \&create_extract_view,
+    },
+);
+
+# GUI global variables
+my ($window, $cmdbox, $inbox, $htmlview);
+my $prev_btn;
+my ($next, $next_fctn, $target_hd);
+my ($progress, $progress_status);
+
+my ($ipversion, $ipaddress, $ipconf_entry_addr);
+my ($netmask, $ipconf_entry_mask);
+my ($gateway, $ipconf_entry_gw);
+my ($dnsserver, $ipconf_entry_dns);
+my $hostname = 'proxmox';
+my $domain = 'domain.tld';
+my $cmdline = file_read_firstline("/proc/cmdline");
+my $ipconf;
+my $country;
+my $timezone = 'Europe/Vienna';
+my $keymap = 'en-us';
+my $password;
+my $mailto = 'mail@example.invalid';
+my $cmap;
+
+my $config = {
+    # TODO: add all the user-provided options for previous button
+    country => $country,
+    timezone => $timezone,
+    keymap => $keymap,
+
+    password => $password,
+    mailto => $mailto,
+
+    mngmt_nic => undef,
+    hostname => $hostname,
+    fqdn => undef,
+    ipaddress => undef,
+    netmask => undef,
+    gateway => undef,
+};
+
+# parse command line args
+
+my $config_options = {};
+
+if ($cmdline =~ m/\s(ext3|ext4|xfs)(\s.*)?$/) {
+    $config_options->{filesys} = $1;
+} else {
+    $config_options->{filesys} = 'ext4';
+}
+
+if ($cmdline =~ m/hdsize=(\d+(\.\d+)?)[\s\n]/i) {
+    $config_options->{hdsize} = $1;
+}
+
+if ($cmdline =~ m/swapsize=(\d+(\.\d+)?)[\s\n]/i) {
+    $config_options->{swapsize} = $1;
+}
+
+if ($cmdline =~ m/maxroot=(\d+(\.\d+)?)[\s\n]/i) {
+    $config_options->{maxroot} = $1;
+}
+
+if ($cmdline =~ m/minfree=(\d+(\.\d+)?)[\s\n]/i) {
+    $config_options->{minfree} = $1;
+}
+
+if ($setup->{product} eq 'pve') {
+    if ($cmdline =~ m/maxvz=(\d+(\.\d+)?)[\s\n]/i) {
+	$config_options->{maxvz} = $1;
+    }
+}
+
+my $postfix_main_cf = <<_EOD;
+# See /usr/share/postfix/main.cf.dist for a commented, more complete version
+
+myhostname=__FQDN__
+
+smtpd_banner = \$myhostname ESMTP \$mail_name (Debian/GNU)
+biff = no
+
+# appending .domain is the MUA's job.
+append_dot_mydomain = no
+
+# Uncomment the next line to generate "delayed mail" warnings
+#delay_warning_time = 4h
+
+alias_maps = hash:/etc/aliases
+alias_database = hash:/etc/aliases
+mydestination = \$myhostname, localhost.\$mydomain, localhost
+relayhost =
+mynetworks = 127.0.0.0/8
+inet_interfaces = loopback-only
+recipient_delimiter = +
+
+_EOD
+
+sub shellquote {
+    my $str = shift;
+
+    return String::ShellQuote::shell_quote($str);
+}
+
+sub cmd2string {
+    my ($cmd) = @_;
+
+    die "no arguments" if !$cmd;
+
+    return $cmd if !ref($cmd);
+
+    my @qa = ();
+    foreach my $arg (@$cmd) { push @qa, shellquote($arg); }
+
+    return join (' ', @qa);
+}
+
+sub syscmd {
+    my ($cmd) = @_;
+
+    return run_command($cmd, undef, undef, 1);
+}
+
+sub run_command {
+    my ($cmd, $func, $input, $noout) = @_;
+
+    my $cmdstr;
+    if (!ref($cmd)) {
+	$cmdstr = $cmd;
+	if ($cmd =~ m/|/) {
+	    # see 'man bash' for option pipefail
+	    $cmd = [ '/bin/bash', '-c', "set -o pipefail && $cmd" ];
+	} else {
+	    $cmd = [ $cmd ];
+	}
+    } else {
+	$cmdstr = cmd2string($cmd);
+    }
+
+    my $cmdtxt;
+    if ($input && ($cmdstr !~ m/chpasswd/)) {
+	$cmdtxt = "# $cmdstr <<EOD\n$input";
+	chomp $cmdtxt;
+	$cmdtxt .= "\nEOD\n";
+    } else {
+	$cmdtxt = "# $cmdstr\n";
+    }
+
+    if ($opt_testmode) {
+	print $cmdtxt;
+	STDOUT->flush();
+    }
+
+    print $logfd $cmdtxt;
+
+    my $reader = IO::File->new();
+    my $writer = IO::File->new();
+    my $error  = IO::File->new();
+
+    my $orig_pid = $$;
+
+    my $pid;
+    eval {
+	$pid = open3($writer, $reader, $error, @$cmd) || die $!;
+    };
+
+    my $err = $@;
+
+    # catch exec errors
+    if ($orig_pid != $$) {
+	POSIX::_exit (1);
+	kill ('KILL', $$);
+    }
+
+    die $err if $err;
+
+    print $writer $input if defined $input;
+    close $writer;
+
+    my $select = new IO::Select;
+    $select->add($reader);
+    $select->add($error);
+
+    my ($ostream, $logout) = ('', '', '');
+
+    while ($select->count) {
+	my @handles = $select->can_read (0.2);
+
+	Gtk3::main_iteration() while Gtk3::events_pending();
+
+	next if !scalar (@handles); # timeout
+
+	foreach my $h (@handles) {
+	    my $buf = '';
+	    my $count = sysread ($h, $buf, 4096);
+	    if (!defined ($count)) {
+		my $err = $!;
+		kill (9, $pid);
+		waitpid ($pid, 0);
+		die "command '$cmd' failed: $err";
+	    }
+	    $select->remove($h) if !$count;
+	    if ($h eq $reader) {
+		$ostream .= $buf if !($noout || $func);
+		$logout .= $buf;
+		while ($logout =~ s/^([^\010\r\n]*)(\r|\n|(\010)+|\r\n)//s) {
+		    my $line = $1;
+		    &$func($line) if $func;
+		}
+
+	    } elsif ($h eq $error) {
+		$ostream .= $buf if !($noout || $func);
+	    }
+	    print $buf;
+	    STDOUT->flush();
+	    print $logfd $buf;
+	}
+    }
+
+    &$func($logout) if $func;
+
+    my $rv = waitpid ($pid, 0);
+
+    return $? if $noout; # behave like standard system();
+
+    if ($? == -1) {
+	die "command '$cmdstr' failed to execute\n";
+    } elsif (my $sig = ($? & 127)) {
+	die "command '$cmdstr' failed - got signal $sig\n";
+    } elsif (my $exitcode = ($? >> 8)) {
+	die "command '$cmdstr' failed with exit code $exitcode";
+    }
+
+    return $ostream;
+}
+
+sub detect_country {
+
+    print "trying to detect country...\n";
+    my $cpid = open2(\*TMP, undef, "traceroute -N 1 -q 1 -n 8.8.8.8");
+    return undef if !$cpid;
+
+    my $country;
+
+    my $previous_alarm = alarm (10);
+    eval  {
+	local $SIG{ALRM} = sub { die "timed out!\n" };
+	my $line;
+	while (defined ($line = <TMP>)) {
+	    print $logfd "DC TRACEROUTE: $line";
+	    if ($line =~ m/\s*\d+\s+(\d+\.\d+\.\d+\.\d+)\s/) {
+		my $geoip = `geoiplookup $1`;
+		print $logfd "DC GEOIP: $geoip";
+		if ($geoip =~ m/GeoIP Country Edition:\s*([A-Z]+),/) {
+		    $country = lc ($1);
+		    print $logfd "DC FOUND: $country\n";
+		    last;
+		}
+	    }
+	}
+    };
+
+    my $err = $@;
+
+    alarm ($previous_alarm);
+
+    close (TMP);
+
+    if ($err) {
+	print "unable to detect country - $err\n";
+    } elsif ($country) {
+	print "detected country: " . uc($country) . "\n";
+    } else {
+	print "unable to detect country\n";
+    }
+
+    return $country;
+}
+
+sub get_memtotal {
+
+    open (MEMINFO, "/proc/meminfo");
+
+    my $res = 512; # default to 512 if something goes wrong
+    while (my $line = <MEMINFO>) {
+	if ($line =~ m/^MemTotal:\s+(\d+)\s*kB/i) {
+	    $res = int ($1 / 1024);
+	}
+    }
+
+    close (MEMINFO);
+
+    return $res;
+}
+
+my $total_memory = get_memtotal();
+
+sub link_points_to {
+    my ($src, $dest) = @_;
+
+    my ($dev1,$ino1) = stat ($src);
+    my ($dev2,$ino2) = stat ($dest);
+
+    return 0 if !($dev1 && $dev2 && $ino1 && $ino2);
+
+    return $ino1 == $ino2 && $dev1 == $dev2;
+}
+
+sub find_stable_path {
+    my ($stabledir, $bdev) = @_;
+
+    foreach my $path (<$stabledir/*>) {
+	if (link_points_to($path, $bdev)) {
+	    return wantarray ? ($path, basename($path)) : $path;
+	}
+    }
+}
+
+sub find_dev_by_uuid {
+    my $bdev = shift;
+
+    my ($full_path, $name) = find_stable_path("/dev/disk/by-uuid", $bdev);
+
+    return $name;
+}
+
+sub hd_list {
+
+    my $res = ();
+
+    if ($opt_testmode) {
+	my @disks = split /,/, $opt_testmode;
+
+	for my $disk (@disks) {
+	    push @$res, [-1, $disk, int((-s $disk)/512), "TESTDISK"];
+	}
+	return $res;
+    }
+
+    my $count = 0;
+
+    foreach my $bd (</sys/block/*>) {
+	next if $bd =~ m|^/sys/block/ram\d+$|;
+	next if $bd =~ m|^/sys/block/loop\d+$|;
+	next if $bd =~ m|^/sys/block/md\d+$|;
+	next if $bd =~ m|^/sys/block/dm-.*$|;
+	next if $bd =~ m|^/sys/block/fd\d+$|;
+	next if $bd =~ m|^/sys/block/sr\d+$|;
+
+	my $dev = file_read_firstline("$bd/dev");
+	chomp $dev;
+
+	next if !$dev;
+
+	my $info = `udevadm info --path $bd --query all`;
+	next if !$info;
+
+	next if $info !~ m/^E: DEVTYPE=disk$/m;
+
+	next if $info =~ m/^E: ID_CDROM/m;
+
+	my ($name) = $info =~ m/^N: (\S+)$/m;
+
+	if ($name) {
+	    my $real_name = "/dev/$name";
+
+	    my $size = file_read_firstline("$bd/size");
+	    chomp $size;
+	    $size = undef if !($size && $size =~ m/^\d+$/);
+
+	    my $model = file_read_firstline("$bd/device/model") || '';
+	    $model =~ s/^\s+//;
+	    $model =~ s/\s+$//;
+	    if (length ($model) > 30) {
+		$model = substr ($model, 0, 30);
+	    }
+	    push @$res, [$count++, $real_name, $size, $model] if $size;
+	} else {
+	    print STDERR "ERROR: unable to map device $dev ($bd)\n";
+	}
+    }
+
+    return $res;
+}
+
+sub read_cmap {
+    my $countryfn = "${proxmox_libdir}/country.dat";
+    open (TMP, "<$countryfn") || die "unable to open '$countryfn' - $!\n";
+    my $line;
+    my $country = {};
+    my $countryhash = {};
+    my $kmap = {};
+    my $kmaphash = {};
+    while (defined ($line = <TMP>)) {
+	if ($line =~ m|^map:([^\s:]+):([^:]+):([^:]+):([^:]+):([^:]+):([^:]*):$|) {
+	    $kmap->{$1} = {
+		name => $2,
+		kvm => $3,
+		console => $4,
+		x11 => $5,
+		x11var => $6,
+	    };
+	    $kmaphash->{$2} = $1;
+	} elsif ($line =~ m|^([a-z]{2}):([^:]+):([^:]*):([^:]*):$|) {
+	    $country->{$1} = {
+		name => $2,
+		kmap => $3,
+		mirror => $4,
+	    };
+	    $countryhash->{lc($2)} = $1;
+	} else {
+	    warn "unable to parse 'country.dat' line: $line";
+	}
+    }
+    close (TMP);
+
+    my $zones = {};
+    my $cczones = {};
+    my $zonefn = "/usr/share/zoneinfo/zone.tab";
+    open (TMP, "<$zonefn") || die "unable to open '$zonefn' - $!\n";
+    while (defined ($line = <TMP>)) {
+	next if $line =~ m/^\#/;
+	next if $line =~ m/^\s*$/;
+	if ($line =~ m|^([A-Z][A-Z])\s+\S+\s+(([^/]+)/\S+)\s|) {
+	    my $cc = lc($1);
+	    $cczones->{$cc}->{$2} = 1;
+	    $country->{$cc}->{zone} = $2 if !defined ($country->{$cc}->{zone});
+	    $zones->{$2} = 1;
+
+	}
+    }
+    close (TMP);
+
+    return {
+	zones => $zones,
+	cczones => $cczones,
+	country => $country,
+	countryhash => $countryhash,
+	kmap => $kmap,
+	kmaphash => $kmaphash,
+    }
+}
+
+# search for Harddisks
+my $hds = hd_list();
+
+sub hd_size {
+    my ($dev) = @_;
+
+    foreach my $hd (@$hds) {
+	my ($disk, $devname, $size, $model) = @$hd;
+	# size is always in 512B "sectors"! convert to KB
+	return int($size/2) if $devname eq $dev;
+    }
+
+    die "no such device '$dev'\n";
+}
+
+sub get_partition_dev {
+    my ($dev, $partnum) = @_;
+
+    if ($dev =~ m|^/dev/sd([a-h]?[a-z]\|i[a-v])$|) {
+	return "${dev}$partnum";
+    } elsif ($dev =~ m|^/dev/xvd[a-z]$|) {
+	# Citrix Hypervisor blockdev
+	return "${dev}$partnum";
+    } elsif ($dev =~ m|^/dev/[hxev]d[a-z]$|) {
+	return "${dev}$partnum";
+    } elsif ($dev =~ m|^/dev/[^/]+/c\d+d\d+$|) {
+	return "${dev}p$partnum";
+    } elsif ($dev =~ m|^/dev/[^/]+/d\d+$|) {
+	return "${dev}p$partnum";
+    } elsif ($dev =~ m|^/dev/[^/]+/hd[a-z]$|) {
+	return "${dev}$partnum";
+    } elsif ($dev =~ m|^/dev/nvme\d+n\d+$|) {
+	return "${dev}p$partnum";
+    } else {
+	die "unable to get device for partition $partnum on device $dev\n";
+    }
+
+}
+
+sub file_get_contents {
+    my ($filename, $max) = @_;
+
+    my $fh = IO::File->new($filename, "r") ||
+	die "can't open '$filename' - $!\n";
+
+    local $/; # slurp mode
+
+    my $content = <$fh>;
+
+    close $fh;
+
+    return $content;
+}
+
+sub write_config {
+    my ($text, $filename) = @_;
+
+    my $fd = IO::File->new(">$filename") ||
+	die "unable to open file '$filename' - $!\n";
+    print $fd $text;
+    $fd->close();
+}
+
+sub update_progress {
+    my ($frac, $start, $end, $text) = @_;
+
+    my $part = $end - $start;
+    my $res = $start + $frac*$part;
+
+    $progress->set_fraction ($res);
+    $progress->set_text (sprintf ("%d%%", int ($res*100)));
+    $progress_status->set_text ($text) if defined ($text);
+
+    display_info() if $res < 0.9;
+
+    Gtk3::main_iteration() while Gtk3::events_pending();
+}
+
+my $fssetup = {
+    ext3 => {
+	mkfs => 'mkfs.ext3 -F',
+	mkfs_root_opt => '',
+	mkfs_data_opt => '-m 0',
+	root_mountopt => 'errors=remount-ro',
+    },
+    ext4 => {
+	mkfs => 'mkfs.ext4 -F',
+	mkfs_root_opt => '',
+	mkfs_data_opt => '-m 0',
+	root_mountopt => 'errors=remount-ro',
+    },
+    xfs => {
+	mkfs => 'mkfs.xfs -f',
+	mkfs_root_opt => '',
+	mkfs_data_opt => '',
+	root_mountopt => '',
+    },
+};
+
+sub create_filesystem {
+    my ($dev, $name, $type, $start, $end, $fs, $fe) = @_;
+
+    my $range = $end - $start;
+    my $rs = $start + $range*$fs;
+    my $re = $start + $range*$fe;
+    my $max = 0;
+
+    my $fsdata = $fssetup->{$type} || die "internal error - unknown file system '$type'";
+    my $opts = $name eq 'root' ? $fsdata->{mkfs_root_opt} : $fsdata->{mkfs_data_opt};
+
+    update_progress(0, $rs, $re, "creating $name filesystem");
+
+    run_command("$fsdata->{mkfs} $opts $dev", sub {
+	my $line = shift;
+
+	if ($line =~ m/Writing inode tables:\s+(\d+)\/(\d+)/) {
+	    $max = $2;
+	} elsif ($max && $line =~ m/(\d+)\/$max/) {
+	    update_progress(($1/$max)*0.9, $rs, $re);
+	} elsif ($line =~ m/Creating journal.*done/) {
+	    update_progress(0.95, $rs, $re);
+	} elsif ($line =~ m/Writing superblocks and filesystem.*done/) {
+	    update_progress(1, $rs, $re);
+	}
+    });
+}
+
+sub debconfig_set {
+    my ($targetdir, $dcdata) = @_;
+
+    my $cfgfile = "/tmp/debconf.txt";
+    write_config($dcdata, "$targetdir/$cfgfile");
+    syscmd("chroot $targetdir debconf-set-selections $cfgfile");
+    unlink "$targetdir/$cfgfile";
+}
+
+sub diversion_add {
+    my ($targetdir, $cmd, $new_cmd) = @_;
+
+    syscmd("chroot $targetdir dpkg-divert --package proxmox " .
+	   "--add --rename $cmd") == 0 ||
+	   die "unable to exec dpkg-divert\n";
+
+    syscmd("ln -sf ${new_cmd} $targetdir/$cmd") == 0 ||
+	die "unable to link diversion to ${new_cmd}\n";
+}
+
+sub diversion_remove {
+    my  ($targetdir, $cmd) = @_;
+
+    syscmd("mv $targetdir/${cmd}.distrib $targetdir/${cmd};") == 0 ||
+	die "unable to remove $cmd diversion\n";
+
+    syscmd("chroot $targetdir dpkg-divert --remove $cmd") == 0 ||
+	die "unable to remove $cmd diversion\n";
+}
+
+sub btrfs_create {
+    my ($partitions, $mode) = @_;
+
+    die "unknown btrfs mode '$mode'"
+	if !($mode eq 'single' || $mode eq 'raid0' ||
+	     $mode eq 'raid1' || $mode eq 'raid10');
+
+    my $cmd = ['mkfs.btrfs', '-f'];
+
+    push @$cmd, '-d', $mode, '-m', $mode;
+
+    push @$cmd, @$partitions;
+
+    syscmd($cmd);
+}
+
+sub zfs_create_rpool {
+    my ($vdev) = @_;
+
+    my $cmd = "zpool create -f -o cachefile=none";
+
+    $cmd .= " -o ashift=$config_options->{ashift}"
+        if defined($config_options->{ashift});
+
+    syscmd("$cmd $zfspoolname $vdev") == 0 ||
+	die "unable to create zfs root pool\n";
+
+    syscmd("zfs create $zfspoolname/ROOT")  == 0 ||
+        die "unable to create zfs $zfspoolname/ROOT volume\n";
+
+    if ($setup->{product} eq 'pve') {
+	syscmd("zfs create $zfspoolname/data")  == 0 ||
+	    die "unable to create zfs $zfspoolname/data volume\n";
+    }
+
+    syscmd("zfs create $zfspoolname/ROOT/$zfsrootvolname")  == 0 ||
+	die "unable to create zfs $zfspoolname/ROOT/$zfsrootvolname volume\n";
+
+    # disable atime during install
+    syscmd("zfs set atime=off $zfspoolname") == 0 ||
+	die "unable to set zfs properties\n";
+
+    my $value = $config_options->{compress};
+    syscmd("zfs set compression=$value $zfspoolname")
+        if defined($value) && $value ne 'off';
+
+    $value = $config_options->{checksum};
+    syscmd("zfs set checksum=$value $zfspoolname")
+        if defined($value) && $value ne 'on';
+
+    $value = $config_options->{copies};
+    syscmd("zfs set copies=$value $zfspoolname")
+        if defined($value) && $value != 1;
+}
+
+my $udevadm_trigger_block = sub {
+    my ($nowait) = @_;
+
+    sleep(1) if !$nowait; # give kernel time to reread part table
+
+    # trigger udev to create /dev/disk/by-uuid
+    syscmd("udevadm trigger --subsystem-match block");
+    syscmd("udevadm settle --timeout 10");
+};
+
+my $clean_disk = sub {
+    my ($disk) = @_;
+
+    my $partitions = `lsblk --output kname --noheadings --path --list $disk`;
+    foreach my $part (split "\n", $partitions) {
+	next if $part eq $disk;
+	next if $part !~ /^\Q$disk\E/;
+	eval { syscmd("pvremove -ff -y $part"); };
+	eval { syscmd("dd if=/dev/zero of=$part bs=1M count=16"); };
+    }
+};
+
+sub partition_bootable_disk {
+    my ($target_dev, $maxhdsizegb, $ptype) = @_;
+
+    die "too dangerous" if $opt_testmode;
+
+    die "unknown partition type '$ptype'"
+	if !($ptype eq '8E00' || $ptype eq '8300' || $ptype eq 'BF01');
+
+    syscmd("sgdisk -Z ${target_dev}");
+    my $hdsize = hd_size($target_dev); # size in KB (1024 bytes)
+
+    my $restricted_hdsize_mb = 0; # 0 ==> end of partition
+    if ($maxhdsizegb) {
+	my $maxhdsize = $maxhdsizegb * 1024 * 1024;
+	if ($maxhdsize < $hdsize) {
+	    $hdsize = $maxhdsize;
+	    $restricted_hdsize_mb = int($hdsize/1024) . 'M';
+	}
+    }
+
+    my $hdgb = int($hdsize/(1024*1024));
+    die "hardisk '$target_dev' too small (${hdgb}GB)\n" if $hdgb < 8;
+
+    # 1 - BIOS boot partition (Grub Stage2): first free 1M
+    # 2 - EFI ESP: next free 512M
+    # 3 - OS/Data partition: rest, up to $maxhdsize in MB
+
+    my $grubbootdev = get_partition_dev($target_dev, 1);
+    my $efibootdev = get_partition_dev($target_dev, 2);
+    my $osdev = get_partition_dev ($target_dev, 3);
+
+    my $pcmd = ['sgdisk'];
+
+    my $pnum = 2;
+    push @$pcmd, "-n${pnum}:1M:+512M", "-t$pnum:EF00";
+
+    $pnum = 3;
+    push @$pcmd, "-n${pnum}:513M:${restricted_hdsize_mb}", "-t$pnum:$ptype";
+
+    push @$pcmd, $target_dev;
+
+    my $os_size = $hdsize - 513*1024; # 512M efi + 1M bios_boot + 1M alignment
+
+    syscmd($pcmd) == 0 ||
+	die "unable to partition harddisk '${target_dev}'\n";
+
+    $pnum = 1;
+    $pcmd = ['sgdisk', '-a1', "-n$pnum:34:2047", "-t$pnum:EF02" , $target_dev];
+
+    syscmd($pcmd) == 0 ||
+	die "unable to create bios_boot partition '${target_dev}'\n";
+
+    &$udevadm_trigger_block();
+
+    foreach my $part ($efibootdev, $osdev) {
+	syscmd("dd if=/dev/zero of=$part bs=1M count=256") if -b $part;
+    }
+
+    return ($os_size, $osdev, $efibootdev);
+}
+
+sub create_lvm_volumes {
+    my ($lvmdev, $os_size, $swap_size) = @_;
+
+    my $vgname = $setup->{product};
+
+    my $rootdev = "/dev/$vgname/root";
+    my $datadev = "/dev/$vgname/data";
+    my $swapfile;
+
+    # we use --metadatasize 250k, which results in "pe_start = 512"
+    # so pe_start is aligned on a 128k boundary (advantage for SSDs)
+    syscmd("/sbin/pvcreate --metadatasize 250k -y -ff $lvmdev") == 0 ||
+	die "unable to initialize physical volume $lvmdev\n";
+    syscmd("/sbin/vgcreate $vgname $lvmdev") == 0 ||
+	die "unable to create volume group '$vgname'\n";
+
+    my $hdgb = int($os_size/(1024*1024));
+    my $space = (($hdgb > 128) ? 16 : ($hdgb/8))*1024*1024;
+
+    my $rootsize;
+    my $datasize;
+
+    if ($setup->{product} eq 'pve') {
+
+	my $maxroot;
+	if ($config_options->{maxroot}) {
+	    $maxroot = $config_options->{maxroot};
+	} else {
+	    $maxroot = 96;
+	}
+
+	$rootsize = (($hdgb > ($maxroot*4)) ? $maxroot : $hdgb/4)*1024*1024;
+
+	my $rest = $os_size - $swap_size - $rootsize; # in KB
+
+	my $minfree;
+	if (defined($config_options->{minfree})) {
+	    $minfree = (($config_options->{minfree}*1024*1024) >= $rest ) ? $space :
+		$config_options->{minfree}*1024*1024 ;
+	} else {
+	    $minfree = $space;
+	}
+
+	$rest = $rest - $minfree;
+
+	if (defined($config_options->{maxvz})) {
+	    $rest = (($config_options->{maxvz}*1024*1024) <= $rest) ?
+		$config_options->{maxvz}*1024*1024 : $rest;
+	}
+
+	$datasize = $rest;
+
+    } else {
+	my $minfree = defined($config_options->{minfree}) ? $config_options->{minfree}*1024*1024 : $space;
+	$rootsize = $os_size - $minfree - $swap_size; # in KB
+    }
+
+    if ($swap_size) {
+	syscmd("/sbin/lvcreate -L${swap_size}K -nswap $vgname") == 0 ||
+	    die "unable to create swap volume\n";
+
+	$swapfile = "/dev/$vgname/swap";
+    }
+
+    syscmd("/sbin/lvcreate -L${rootsize}K -nroot $vgname") == 0 ||
+	die "unable to create root volume\n";
+
+    if ($datasize > 4*1024*1024) {
+	my $metadatasize = $datasize/100; # default 1% of data
+	$metadatasize = 1024*1024 if $metadatasize < 1024*1024; # but at least 1G
+	$metadatasize = 16*1024*1024 if $metadatasize > 16*1024*1024; # but at most 16G
+
+	# otherwise the metadata is taken out of $minfree
+	$datasize -= 2*$metadatasize;
+
+	# 1 4MB PE to allow for rounding
+	$datasize -= 4*1024;
+
+	syscmd("/sbin/lvcreate -L${datasize}K -ndata $vgname") == 0 ||
+	    die "unable to create data volume\n";
+
+	syscmd("/sbin/lvconvert --yes --type thin-pool --poolmetadatasize ${metadatasize}K $vgname/data") == 0 ||
+	    die "unable to create data thin-pool\n";
+    } else {
+	$datadev = undef;
+    }
+
+    syscmd("/sbin/vgchange -a y $vgname") == 0 ||
+	die "unable to activate volume group\n";
+
+    return ($rootdev, $swapfile, $datadev);
+}
+
+sub compute_swapsize {
+    my ($hdsize) = @_;
+
+    my $hdgb = int($hdsize/(1024*1024));
+
+    my $swapsize;
+    if (defined($config_options->{swapsize})) {
+	$swapsize = $config_options->{swapsize}*1024*1024;
+    } else {
+	my $ss = int ($total_memory / 1024);
+	$ss = 4 if $ss < 4;
+	$ss = ($hdgb/8) if $ss > ($hdgb/8);
+	$ss = 8 if $ss > 8;
+	$swapsize = $ss*1024*1024;
+    }
+
+    return $swapsize;
+}
+
+
+sub extract_data {
+    my ($basefile, $targetdir) = @_;
+
+    die "target '$targetdir' does not exist\n" if ! -d  $targetdir;
+
+    my $starttime = [Time::HiRes::gettimeofday];
+
+    my $bootdevinfo = [];
+
+    my $swapfile;
+    my $rootdev;
+    my $datadev;
+
+    my $use_zfs = 0;
+    my $use_btrfs = 0;
+
+    my $filesys = $config_options->{filesys};
+
+    if ($filesys =~ m/zfs/) {
+	$target_hd = undef; # do not use this config
+	$use_zfs = 1;
+	$targetdir = "/$zfspoolname/ROOT/$zfsrootvolname";
+    } elsif ($filesys =~ m/btrfs/) {
+	$target_hd = undef; # do not use this config
+	$use_btrfs = 1;
+    }
+
+    if ($use_zfs) {
+	my $i;
+	for ($i = 5; $i > 0; $i--) {
+	    syscmd("modprobe zfs");
+	    last if -c "/dev/zfs";
+	    sleep(1);
+	}
+
+	die "unable to load zfs kernel module\n" if !$i;
+    }
+
+    eval {
+
+
+	my $maxper = 0.25;
+
+	update_progress(0, 0, $maxper, "create partitions");
+
+	syscmd("vgchange -an") if !$opt_testmode; # deactivate all detected VGs
+
+	if ($opt_testmode) {
+
+	    $rootdev = abs_path($opt_testmode);
+	    syscmd("umount $rootdev");
+
+	    if ($use_btrfs) {
+
+		die "unsupported btrfs mode (for testing environment)\n"
+		    if $filesys ne 'btrfs (RAID0)';
+
+		btrfs_create([$rootdev], 'single');
+
+	    } elsif ($use_zfs) {
+
+		die "unsupported zfs mode (for testing environment)\n"
+		    if $filesys ne 'zfs (RAID0)';
+
+		syscmd("zpool destroy $zfstestpool");
+
+		zfs_create_rpool($rootdev);
+
+	    } else {
+
+		# nothing to do
+	    }
+
+	} elsif ($use_btrfs) {
+
+	    my ($devlist, $btrfs_mode) = get_btrfs_raid_setup();
+	    my $btrfs_partitions = [];
+	    my $disksize;
+	    foreach my $hd (@$devlist) {
+		my $devname = @$hd[1];
+		&$clean_disk($devname);
+		my ($size, $osdev, $efidev) =
+		    partition_bootable_disk($devname, undef, '8300');
+		$rootdev = $osdev if !defined($rootdev); # simply point to first disk
+		my $by_id = find_stable_path("/dev/disk/by-id", $devname);
+		push @$bootdevinfo, { esp => $efidev, devname => $devname,
+				      osdev => $osdev, by_id => $by_id };
+		push @$btrfs_partitions, $osdev;
+		$disksize = $size;
+	    }
+
+	    &$udevadm_trigger_block();
+
+	    btrfs_create($btrfs_partitions, $btrfs_mode);
+
+	} elsif ($use_zfs) {
+
+	    my ($devlist, $bootdevlist, $vdev) = get_zfs_raid_setup();
+
+	    my $disksize;
+	    foreach my $hd (@$devlist) {
+		&$clean_disk(@$hd[1]);
+	    }
+	    foreach my $hd (@$bootdevlist) {
+		my $devname = @$hd[1];
+
+		my ($size, $osdev) =
+		    partition_bootable_disk($devname, $config_options->{hdsize}, 'BF01');
+		zfs_mirror_size_check($disksize, $size) if $disksize;
+		push @$bootdevinfo, { devname => $devname, osdev => $osdev};
+		$disksize = $size;
+	    }
+
+	    &$udevadm_trigger_block();
+
+	    foreach my $di (@$bootdevinfo) {
+		my $devname = $di->{devname};
+		$di->{by_id} = find_stable_path ("/dev/disk/by-id", $devname);
+
+		# Note: using /dev/disk/by-id/ does not work for unknown reason, we get
+		# cannot create 'rpool': no such pool or dataset
+		#my $osdev = find_stable_path ("/dev/disk/by-id", $di->{osdev}) || $di->{osdev};
+
+		my $osdev = $di->{osdev};
+		$vdev =~ s/ $devname/ $osdev/;
+	    }
+
+	    zfs_create_rpool($vdev);
+
+	} else {
+
+	    die "target '$target_hd' is not a valid block device\n" if ! -b $target_hd;
+
+	    &$clean_disk($target_hd);
+
+	    my ($os_size, $osdev, $efidev);
+	    ($os_size, $osdev, $efidev) =
+		partition_bootable_disk($target_hd, $config_options->{hdsize}, '8E00');
+
+	    &$udevadm_trigger_block();
+
+	    my $by_id = find_stable_path ("/dev/disk/by-id", $target_hd);
+	    push @$bootdevinfo, { esp => $efidev, devname => $target_hd,
+				  osdev => $osdev, by_id => $by_id };
+
+	    my $swap_size = compute_swapsize($os_size);
+	    ($rootdev, $swapfile, $datadev) =
+		create_lvm_volumes($osdev, $os_size, $swap_size);
+
+	    # trigger udev to create /dev/disk/by-uuid
+	    &$udevadm_trigger_block(1);
+	}
+
+	if ($use_zfs) {
+	    # to be fast during installation
+	    syscmd("zfs set sync=disabled $zfspoolname") == 0 ||
+		die "unable to set zfs properties\n";
+	}
+
+	update_progress(0.03, 0, $maxper, "create swap space");
+	if ($swapfile) {
+	    syscmd("mkswap -f $swapfile") == 0 ||
+		die "unable to create swap space\n";
+	}
+
+	update_progress(0.05, 0, $maxper, "creating filesystems");
+
+	foreach my $di (@$bootdevinfo) {
+	    next if !$di->{esp};
+	    syscmd("mkfs.vfat -F32 $di->{esp}") == 0 ||
+		die "unable to initialize EFI ESP on device $di->{esp}\n";
+	}
+
+	if ($use_zfs) {
+	    # do nothing
+	} elsif ($use_btrfs) {
+	    # do nothing
+	} else {
+	    create_filesystem($rootdev, 'root', $filesys, 0.05, $maxper, 0, 1);
+	}
+
+	update_progress(1, 0.05, $maxper, "mounting target $rootdev");
+
+	if ($use_zfs) {
+	    # do nothing
+	} else {
+	    my $mount_opts = 'noatime';
+	    $mount_opts .= ',nobarrier'
+		if $use_btrfs || $filesys =~ /^ext\d$/;
+
+	    syscmd("mount -n $rootdev -o $mount_opts $targetdir") == 0 ||
+		die "unable to mount $rootdev\n";
+	}
+
+	mkdir "$targetdir/boot";
+	mkdir "$targetdir/boot/efi";
+
+	mkdir "$targetdir/var";
+	mkdir "$targetdir/var/lib";
+
+	if ($setup->{product} eq 'pve') {
+	    mkdir "$targetdir/var/lib/vz";
+	    mkdir "$targetdir/var/lib/pve";
+
+	    if ($use_btrfs) {
+		syscmd("btrfs subvolume create $targetdir/var/lib/pve/local-btrfs") == 0 ||
+		    die "unable to create btrfs subvolume\n";
+	    }
+	}
+
+	update_progress(1, 0.05, $maxper, "extracting base system");
+
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size) = stat ($basefile);
+	$ino || die "unable to open file '$basefile' - $!\n";
+
+	my $files = file_read_firstline("${proxmox_cddir}/proxmox/$setup->{product}-base.cnt") ||
+	    die "unable to read base file count\n";
+
+	my $per = 0;
+	my $count = 0;
+
+	run_command("unsquashfs -f -dest $targetdir -i $basefile", sub {
+	    my $line = shift;
+	    return if $line !~ m/^$targetdir/;
+	    $count++;
+	    my $nper = int (($count *100)/$files);
+	    if ($nper != $per) {
+		$per = $nper;
+		my $frac = $per > 100 ? 1 : $per/100;
+		update_progress($frac, $maxper, 0.5);
+	    }
+	});
+
+	syscmd("mount -n -t tmpfs tmpfs $targetdir/tmp") == 0 ||
+	    die "unable to mount tmpfs on $targetdir/tmp\n";
+	syscmd("mount -n -t proc proc $targetdir/proc") == 0 ||
+	    die "unable to mount proc on $targetdir/proc\n";
+	syscmd("mount -n -t sysfs sysfs $targetdir/sys") == 0 ||
+	    die "unable to mount sysfs on $targetdir/sys\n";
+
+	update_progress(1, $maxper, 0.5, "configuring base system");
+
+	# configure hosts
+
+	my $hosts =
+	    "127.0.0.1 localhost.localdomain localhost\n" .
+	    "$ipaddress $hostname.$domain $hostname\n\n" .
+	    "# The following lines are desirable for IPv6 capable hosts\n\n" .
+	    "::1     ip6-localhost ip6-loopback\n" .
+	    "fe00::0 ip6-localnet\n" .
+	    "ff00::0 ip6-mcastprefix\n" .
+	    "ff02::1 ip6-allnodes\n" .
+	    "ff02::2 ip6-allrouters\n" .
+	    "ff02::3 ip6-allhosts\n";
+
+	write_config($hosts, "$targetdir/etc/hosts");
+
+	write_config("$hostname\n", "$targetdir/etc/hostname");
+
+	syscmd("/bin/hostname $hostname") if !$opt_testmode;
+
+	# configure interfaces
+
+	my $ifaces = "auto lo\niface lo inet loopback\n\n";
+
+	my $ntype = $ipversion == 4 ? 'inet' : 'inet6';
+
+	my $ethdev = $ipconf->{ifaces}->{$ipconf->{selected}}->{name};
+
+	if ($setup->{bridged_network}) {
+	    $ifaces .= "iface $ethdev $ntype manual\n";
+
+	    $ifaces .=
+		"\nauto vmbr0\niface vmbr0 $ntype static\n" .
+		"\taddress $ipaddress\n" .
+		"\tnetmask $netmask\n" .
+		"\tgateway $gateway\n" .
+		"\tbridge_ports $ethdev\n" .
+		"\tbridge_stp off\n" .
+		"\tbridge_fd 0\n";
+	} else {
+	    $ifaces .= "auto $ethdev\n" .
+		"iface $ethdev $ntype static\n" .
+		"\taddress $ipaddress\n" .
+		"\tnetmask $netmask\n" .
+		"\tgateway $gateway\n";
+	}
+
+	foreach my $iface (sort keys %{$ipconf->{ifaces}}) {
+	    my $name = $ipconf->{ifaces}->{$iface}->{name};
+	    next if $name eq $ethdev;
+
+	    $ifaces .= "\niface $name $ntype manual\n";
+	}
+
+	write_config($ifaces, "$targetdir/etc/network/interfaces");
+
+	# configure dns
+
+	my $resolvconf = "search $domain\nnameserver $dnsserver\n";
+	write_config($resolvconf, "$targetdir/etc/resolv.conf");
+
+	# configure fstab
+
+	my $fstab = "# <file system> <mount point> <type> <options> <dump> <pass>\n";
+
+	if ($use_zfs) {
+	    # do nothing
+	} elsif ($use_btrfs) {
+	    my $fsuuid;
+	    my $cmd = "blkid -u filesystem -t TYPE=btrfs -o export $rootdev";
+	    run_command($cmd, sub {
+		my $line = shift;
+
+		if ($line =~ m/^UUID=([A-Fa-f0-9\-]+)$/) {
+		    $fsuuid = $1;
+		}
+	    });
+
+	    die "unable to detect FS UUID" if !defined($fsuuid);
+
+	    $fstab .= "UUID=$fsuuid / btrfs defaults 0 1\n";
+	} else {
+	    my $root_mountopt = $fssetup->{$filesys}->{root_mountopt} || 'defaults';
+	    $fstab .= "$rootdev / $filesys ${root_mountopt} 0 1\n";
+	}
+
+	# mount /boot/efi
+	# Note: this is required by current grub, but really dangerous, because
+	# vfat does not have journaling, so it triggers manual fsck after each crash
+	# so we only mount /boot/efi if really required (efi systems).
+	if ($grub_plattform =~ m/^efi-/) {
+	    if (scalar(@$bootdevinfo)) {
+		my $di = @$bootdevinfo[0]; # simply use first disk
+		if ($di->{esp}) {
+		    my $efi_boot_uuid = $di->{esp};
+		    if (my $uuid = find_dev_by_uuid ($di->{esp})) {
+			$efi_boot_uuid = "UUID=$uuid";
+		    }
+
+		    $fstab .= "${efi_boot_uuid} /boot/efi vfat defaults 0 1\n";
+		}
+	    }
+	}
+
+
+	$fstab .= "$swapfile none swap sw 0 0\n" if $swapfile;
+
+	$fstab .= "proc /proc proc defaults 0 0\n";
+
+	write_config($fstab, "$targetdir/etc/fstab");
+	write_config("", "$targetdir/etc/mtab");
+
+	syscmd("cp ${proxmox_libdir}/policy-disable-rc.d " .
+		"$targetdir/usr/sbin/policy-rc.d") == 0 ||
+		die "unable to copy policy-rc.d\n";
+	syscmd("cp ${proxmox_libdir}/fake-start-stop-daemon " .
+		"$targetdir/sbin/") == 0 ||
+		die "unable to copy start-stop-daemon\n";
+
+	diversion_add($targetdir, "/sbin/start-stop-daemon", "/sbin/fake-start-stop-daemon");
+	diversion_add($targetdir, "/usr/sbin/update-grub", "/bin/true");
+	diversion_add($targetdir, "/usr/sbin/update-initramfs", "/bin/true");
+
+	syscmd("touch  $targetdir/proxmox_install_mode");
+
+	my $grub_install_devices_txt = '';
+	foreach my $di (@$bootdevinfo) {
+	    $grub_install_devices_txt .= ', ' if $grub_install_devices_txt;
+	    $grub_install_devices_txt .= $di->{by_id} || $di->{devname};
+	}
+
+	# Note: keyboard-configuration/xbkb-keymap is used by console-setup
+	my $xkmap = $cmap->{kmap}->{$keymap}->{x11} // 'us';
+
+	debconfig_set ($targetdir, <<_EOD);
+locales locales/default_environment_locale select en_US.UTF-8
+locales locales/locales_to_be_generated select en_US.UTF-8 UTF-8
+samba-common samba-common/dhcp boolean false
+samba-common samba-common/workgroup string WORKGROUP
+postfix postfix/main_mailer_type select No configuration
+keyboard-configuration keyboard-configuration/xkb-keymap select $xkmap
+d-i debian-installer/locale select en_US.UTF-8
+grub-pc grub-pc/install_devices select $grub_install_devices_txt
+_EOD
+
+	my $pkg_count = 0;
+	while (<${proxmox_pkgdir}/*.deb>) { $pkg_count++ };
+
+	# btrfs/dpkg is extremely slow without --force-unsafe-io
+	my $dpkg_opts = $use_btrfs ? "--force-unsafe-io" : "";
+
+	$count = 0;
+	while (<${proxmox_pkgdir}/*.deb>) {
+	    chomp;
+	    my $path = $_;
+	    my ($deb) = $path =~ m/${proxmox_pkgdir}\/(.*\.deb)/;
+#	    if ($deb =~ m/^grub-efi-/ && $deb !~ m/^grub-${grub_plattform}/) {
+#		$count++;
+#		next;
+#	    }
+	    update_progress($count/$pkg_count, 0.5, 0.75, "extracting $deb");
+	    print "extracting: $deb\n";
+	    syscmd("cp $path $targetdir/tmp/$deb") == 0 ||
+		die "installation of package $deb failed\n";
+	    syscmd("chroot $targetdir dpkg $dpkg_opts --force-depends --no-triggers --unpack /tmp/$deb") == 0 ||
+		die "installation of package $deb failed\n";
+	    update_progress((++$count)/$pkg_count, 0.5, 0.75);
+	}
+
+	# needed for postfix postinst in case no other NIC is active
+	syscmd("chroot $targetdir ifup lo");
+
+	my $cmd = "chroot $targetdir dpkg $dpkg_opts --force-confold --configure -a";
+	$count = 0;
+	run_command($cmd, sub {
+	    my $line = shift;
+	    if ($line =~ m/Setting up\s+(\S+)/) {
+		update_progress((++$count)/$pkg_count, 0.75, 0.95,
+				"configuring $1");
+	    }
+	});
+
+	unlink "$targetdir/etc/mailname";
+	$postfix_main_cf =~ s/__FQDN__/${hostname}.${domain}/;
+	write_config($postfix_main_cf, "$targetdir/etc/postfix/main.cf");
+
+	# make sure we have all postfix directories
+	syscmd("chroot $targetdir /usr/sbin/postfix check");
+	# cleanup mail queue
+	syscmd("chroot $targetdir /usr/sbin/postsuper -d ALL");
+
+	# enable NTP (timedatectl set-ntp true  does not work without DBUS)
+	syscmd("chroot $targetdir /bin/systemctl enable systemd-timesyncd.service");
+
+	unlink  "$targetdir/proxmox_install_mode";
+
+	# set timezone
+	unlink ("$targetdir/etc/localtime");
+	symlink ("/usr/share/zoneinfo/$timezone", "$targetdir/etc/localtime");
+	write_config("$timezone\n", "$targetdir/etc/timezone");
+
+	# set apt mirror
+	if (my $mirror = $cmap->{country}->{$country}->{mirror}) {
+	    my $fn = "$targetdir/etc/apt/sources.list";
+	    syscmd("sed -i 's/ftp\\.debian\\.org/$mirror/' '$fn'");
+	}
+
+	# create extended_states for apt (avoid cron job warning if that
+	# file does not exist)
+	write_config('', "$targetdir/var/lib/apt/extended_states");
+
+	# allow ssh root login
+	syscmd(['sed', '-i', 's/^#\?PermitRootLogin.*/PermitRootLogin yes/', "$targetdir/etc/ssh/sshd_config"]);
+
+	if ($setup->{product} eq 'pmg') {
+	    # install initial clamav DB
+	    my $srcdir = "${proxmox_cddir}/proxmox/clamav";
+	    foreach my $fn ("main.cvd", "bytecode.cvd", "daily.cvd", "safebrowsing.cvd") {
+		syscmd("cp \"$srcdir/$fn\" \"$targetdir/var/lib/clamav\"") == 0 ||
+		    die "installation of clamav db file '$fn' failed\n";
+	    }
+	    syscmd("chroot $targetdir /bin/chown clamav:clamav -R /var/lib/clamav") == 0 ||
+		die "unable to set owner for clamav database files\n";
+	}
+
+	if ($setup->{product} eq 'pve') {
+	    # save installer settings
+	    my $ucc = uc ($country);
+	    debconfig_set($targetdir, "pve-manager pve-manager/country string $ucc\n");
+	}
+
+	update_progress(0.8, 0.95, 1, "make system bootable");
+
+	if ($use_zfs) {
+	    syscmd("sed -i -e 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=\"root=ZFS=$zfspoolname\\/ROOT\\/$zfsrootvolname boot=zfs\"/' $targetdir/etc/default/grub") == 0 ||
+		die "unable to update /etc/default/grub\n";
+
+	}
+
+	diversion_remove($targetdir, "/usr/sbin/update-grub");
+	diversion_remove($targetdir, "/usr/sbin/update-initramfs");
+
+	my $kapi;
+	foreach my $fn (<$targetdir/lib/modules/*>) {
+	    if ($fn =~ m!/(\d+\.\d+\.\d+-\d+-pve)$!) {
+		die "found multiple kernels\n" if defined($kapi);
+		$kapi = $1;
+	    }
+	}
+	die "unable to detect kernel version\n" if !defined($kapi);
+
+	if (!$opt_testmode) {
+
+	    unlink ("$targetdir/etc/mtab");
+	    symlink ("/proc/mounts", "$targetdir/etc/mtab");
+	    syscmd("mount -n --bind /dev $targetdir/dev");
+
+	    syscmd("chroot $targetdir /usr/sbin/update-initramfs -c -k $kapi") == 0 ||
+		die "unable to install initramfs\n";
+
+	    foreach my $di (@$bootdevinfo) {
+		my $dev = $di->{devname};
+		syscmd("chroot $targetdir /usr/sbin/grub-install --target i386-pc --no-floppy --bootloader-id='proxmox' $dev") == 0 ||
+			die "unable to install the i386-pc boot loader on '$dev'\n";
+
+		if ($di->{esp}) {
+		    syscmd("mount -n $di->{esp} -t vfat $targetdir/boot/efi") == 0 ||
+			die "unable to mount $di->{esp}\n";
+		    my $rc = syscmd("chroot $targetdir /usr/sbin/grub-install --target x86_64-efi --no-floppy --bootloader-id='proxmox' $dev");
+		    if ($rc != 0) {
+			if (-d '/sys/firmware/efi') {
+			    die "unable to install the EFI boot loader on '$dev'\n";
+			} else {
+			    warn "unable to install the EFI boot loader on '$dev', ignoring (not booted using UEFI)\n";
+			}
+		    }
+		    # also install fallback boot file (OVMF does not boot without)
+		    mkdir("$targetdir/boot/efi/EFI/BOOT");
+		    syscmd("cp $targetdir/boot/efi/EFI/proxmox/grubx64.efi $targetdir/boot/efi/EFI/BOOT/BOOTx64.EFI") == 0 ||
+			die "unable to copy efi boot loader\n";
+
+		    syscmd("umount $targetdir/boot/efi") == 0 ||
+			die "unable to umount $targetdir/boot/efi\n";
+		}
+	    }
+
+	    syscmd("chroot $targetdir /usr/sbin/update-grub") == 0 ||
+		die "unable to update boot loader config\n";
+
+	    syscmd("umount $targetdir/dev");
+	}
+
+	# cleanup
+
+	# hack: remove dead.letter from sshd installation
+	syscmd("rm -rf $targetdir/dead.letter");
+
+	unlink "$targetdir/usr/sbin/policy-rc.d";
+
+	diversion_remove($targetdir, "/sbin/start-stop-daemon");
+
+	# set root password
+	my $octets = encode("utf-8", $password);
+	run_command("chroot $targetdir /usr/sbin/chpasswd", undef,
+		    "root:$octets\n");
+
+	if ($setup->{product} eq 'pmg') {
+	    # save admin email
+	    write_config("section: admin\n\temail ${mailto}\n",
+			 "$targetdir/etc/pmg/pmg.conf");
+
+	} elsif ($setup->{product} eq 'pve') {
+
+	    # create pmxcfs DB
+
+	    my $tmpdir = "$targetdir/tmp/pve";
+	    mkdir $tmpdir;
+
+	    # write vnc keymap to datacenter.cfg
+	    my $vnckmap = $cmap->{kmap}->{$keymap}->{kvm} || 'en-us';
+	    write_config("keyboard: $vnckmap\n",
+			 "$tmpdir/datacenter.cfg");
+
+	    # save admin email
+	    write_config("user:root\@pam:1:0:::${mailto}::\n",
+			 "$tmpdir/user.cfg");
+
+	    # write storage.cfg
+	    my $storage_cfg_fn = "$tmpdir/storage.cfg";
+	    if ($use_zfs) {
+		write_config($storage_cfg_zfs, $storage_cfg_fn);
+	    } elsif ($use_btrfs) {
+		write_config($storage_cfg_btrfs, $storage_cfg_fn);
+	    } elsif ($datadev) {
+		write_config($storage_cfg_lvmthin, $storage_cfg_fn);
+	    } else {
+		write_config($storage_cfg_local, $storage_cfg_fn);
+	    }
+
+	    run_command("chroot $targetdir /usr/bin/create_pmxcfs_db /tmp/pve /var/lib/pve-cluster/config.db");
+
+	    syscmd("rm -rf $tmpdir");
+	}
+    };
+
+    my $err = $@;
+
+    update_progress(1, 0, 1, "");
+
+    print $err if $err;
+
+    if ($opt_testmode) {
+	my $elapsed = Time::HiRes::tv_interval($starttime);
+	print "Elapsed extract time: $elapsed\n";
+
+	syscmd("chroot $targetdir /usr/bin/dpkg-query -W --showformat='\${package}\n'> final.pkglist");
+    }
+
+    syscmd("umount $targetdir/tmp");
+    syscmd("umount $targetdir/proc");
+    syscmd("umount $targetdir/sys");
+
+    if ($use_zfs) {
+	syscmd("zfs umount -a") == 0 ||
+	    die "unable to unmount zfs\n";
+    } else {
+	syscmd("umount -d $targetdir");
+    }
+
+    if (!$err && $use_zfs) {
+	syscmd("zfs set sync=standard $zfspoolname") == 0 ||
+	    die "unable to set zfs properties\n";
+
+	syscmd("zfs set mountpoint=/ $zfspoolname/ROOT/$zfsrootvolname") == 0 ||
+	    die "zfs set mountpoint failed\n";
+
+	syscmd("zpool set bootfs=$zfspoolname/ROOT/$zfsrootvolname $zfspoolname")  == 0 ||
+	    die "zfs set bootfs failed\n";
+	syscmd("zpool export $zfspoolname");
+    }
+
+    die $err if $err;
+}
+
+my $last_display_change = 0;
+
+my $display_info_counter = 0;
+
+my $display_info_items = [
+    "extract1-license.htm",
+    "extract2-rulesystem.htm",
+    "extract3-spam.htm",
+    "extract4-virus.htm",
+    ];
+
+sub display_info {
+
+    my $min_display_time = 15;
+
+    my $ctime = time();
+
+    return if ($ctime - $last_display_change) < $min_display_time;
+
+    my $page = $display_info_items->[$display_info_counter % scalar(@$display_info_items)];
+
+    $display_info_counter++;
+
+    display_html($page);
+}
+
+sub display_html {
+    my ($filename) = @_;
+
+    $filename = $steps[$step_number]->{html} if !$filename;
+
+    my $path = "${proxmox_libdir}/html/$filename";
+
+    my $url = "file://$path";
+
+    my $data = file_get_contents($path);
+
+    if ($filename eq 'license.htm') {
+	my $license = decode('utf8', file_get_contents("${proxmox_cddir}/EULA"));
+	my $title = "END USER LICENSE AGREEMENT (EULA)";
+	$data =~ s/__LICENSE__/$license/;
+	$data =~ s/__LICENSE_TITLE__/$title/;
+    }
+
+    $htmlview->load_html_string($data, $url);
+
+    $last_display_change = time();
+}
+
+sub prev_function {
+
+    my ($text, $fctn) = @_;
+
+    $fctn = $step_number if !$fctn;
+    $text = "_Previous" if !$text;
+    $prev_btn->set_label ($text);
+
+    $step_number--;
+    $steps[$step_number]->{function}();
+
+    $prev_btn->grab_focus();
+}
+
+sub set_next {
+    my ($text, $fctn) = @_;
+
+    $next_fctn = $fctn;
+    my $step = $steps[$step_number];
+    $text //= $steps[$step_number]->{next_button} // '_Next';
+    $next->set_label($text);
+
+    $next->grab_focus();
+}
+
+sub create_main_window {
+
+    $window = Gtk3::Window->new();
+    $window->set_default_size(1024, 768);
+    $window->set_has_resize_grip(0);
+    $window->set_decorated(0) if !$opt_testmode;
+
+    my $vbox = Gtk3::VBox->new(0, 0);
+
+    my $logofn = "$setup->{product}-banner.png";
+    my $image = Gtk3::Image->new_from_file("${proxmox_libdir}/$logofn");
+    $vbox->pack_start($image, 0, 0, 0);
+
+    my $hbox = Gtk3::HBox->new(0, 0);
+    $vbox->pack_start($hbox, 1, 1, 0);
+
+ #  my $f1 = Gtk3::Frame->new ('test');
+ #  $f1->set_shadow_type ('none');
+ #  $hbox->pack_start ($f1, 1, 1, 0);
+
+    my $sep1 = Gtk3::HSeparator->new();
+    $vbox->pack_start($sep1, 0, 0, 0);
+
+    $cmdbox = Gtk3::HBox->new();
+    $vbox->pack_start($cmdbox, 0, 0, 10);
+
+    $next = Gtk3::Button->new('_Next');
+    $next->signal_connect(clicked => sub { $last_display_change = 0; &$next_fctn (); });
+    $cmdbox->pack_end($next, 0, 0, 10);
+
+
+    $prev_btn = Gtk3::Button->new('_Previous');
+    $prev_btn->signal_connect(clicked => sub { $last_display_change = 0; &prev_function (); });
+    $cmdbox->pack_end($prev_btn, 0, 0, 10);
+
+
+    my $abort = Gtk3::Button->new('_Abort');
+    $abort->set_can_focus(0);
+    $cmdbox->pack_start($abort, 0, 0, 10);
+    $abort->signal_connect(clicked => sub { exit (-1); });
+
+    my $vbox2 = Gtk3::VBox->new(0, 0);
+    $hbox->add($vbox2);
+
+    $htmlview = Gtk3::WebKit::WebView->new();
+    my $scrolls = Gtk3::ScrolledWindow->new();
+    $scrolls->add($htmlview);
+
+    my $hbox2 = Gtk3::HBox->new(0, 0);
+    $hbox2->pack_start($scrolls, 1, 1, 0);
+
+    $vbox2->pack_start($hbox2, 1, 1, 0);
+
+    my $vbox3 = Gtk3::VBox->new(0, 0);
+    $vbox2->pack_start($vbox3, 0, 0, 0);
+
+    my $sep2 = Gtk3::HSeparator->new;
+    $vbox3->pack_start($sep2, 0, 0, 0);
+
+    $inbox = Gtk3::HBox->new(0, 0);
+    $vbox3->pack_start($inbox, 0, 0, 0);
+
+    $window->add($vbox);
+
+    $window->show_all;
+    $window->realize();
+}
+
+sub cleanup_view {
+    $inbox->foreach(sub {
+	my $child = shift;
+	$inbox->remove ($child);
+    });
+}
+
+# fixme: newer GTK3 has special properties to handle numbers with Entry
+# only allow floating point numbers with Gtk3::Entry
+
+sub check_float {
+    my ($entry, $event) = @_;
+
+    return check_number($entry, $event, 1);
+}
+
+sub check_int {
+    my ($entry, $event) = @_;
+
+    return check_number($entry, $event, 0);
+}
+
+sub check_number {
+    my ($entry, $event, $float) = @_;
+
+    my $val = $event->get_keyval;
+
+    if (($float && $val == ord '.') ||
+	$val == Gtk3::Gdk::KEY_ISO_Left_Tab ||
+	$val == Gtk3::Gdk::KEY_Shift_L ||
+	$val == Gtk3::Gdk::KEY_Tab ||
+	$val == Gtk3::Gdk::KEY_Left ||
+	$val == Gtk3::Gdk::KEY_Right ||
+	$val == Gtk3::Gdk::KEY_BackSpace ||
+	$val == Gtk3::Gdk::KEY_Delete ||
+	($val >= ord '0' && $val <= ord '9') ||
+	($val >= Gtk3::Gdk::KEY_KP_0 &&
+	 $val <= Gtk3::Gdk::KEY_KP_9)) {
+	return undef;
+    }
+
+    return 1;
+}
+
+sub create_text_input {
+    my ($default, $text) = @_;
+
+    my $hbox = Gtk3::HBox->new(0, 0);
+
+    my $label = Gtk3::Label->new($text);
+    $label->set_size_request(150, -1);
+    $label->set_alignment(1, 0.5);
+    $hbox->pack_start($label, 0, 0, 10);
+    my $e1 = Gtk3::Entry->new();
+    $e1->set_width_chars(30);
+    $hbox->pack_start($e1, 0, 0, 0);
+    $e1->set_text($default);
+
+    return ($hbox, $e1);
+}
+
+sub get_ip_config {
+
+    my $ifaces = {};
+    my $default;
+
+    my $links = `ip -o l`;
+    foreach my $l (split /\n/,$links) {
+	my ($index, $name, $flags, $state, $mac) = $l =~ m/^(\d+):\s+(\S+):\s+<(\S+)>.*\s+state\s+(\S+)\s+.*\s+link\/ether\s+(\S+)\s+/;
+	next if !$name || $name eq 'lo';
+
+	my $driver = readlink "/sys/class/net/$name/device/driver" || 'unknown';
+	$driver =~ s!^.*/!!;
+
+	$ifaces->{"$index"} = {
+	    name => $name,
+	    driver => $driver,
+	    flags => $flags,
+	    state => $state,
+	    mac => $mac,
+	};
+
+	my $addresses = `ip -o a s $name`;
+	foreach my $a (split /\n/,$addresses) {
+	    my ($family, $ip, $prefix) = $a =~ m/^\Q$index\E:\s+\Q$name\E\s+(inet|inet6)\s+($IPRE)\/(\d+)\s+/;
+	    next if !$ip;
+	    next if $a =~ /scope\s+link/; # ignore link local
+
+	    my $mask = $prefix;
+
+	    if ($family eq 'inet') {
+		next if !$ip =~ /$IPV4RE/;
+		next if $prefix < 8 || $prefix > 32;
+		$mask = @$ipv4_reverse_mask[$prefix];
+	    } else {
+		next if !$ip =~ /$IPV6RE/;
+	    }
+
+	    $default = $index if !$default;
+
+	    $ifaces->{"$index"}->{"$family"} = {
+		mask => $mask,
+		addr => $ip,
+	    };
+	}
+    }
+
+
+    my $route = `ip route`;
+    my ($gateway) = $route =~ m/^default\s+via\s+(\S+)\s+/m;
+
+    my $resolvconf = `cat /etc/resolv.conf`;
+    my ($dnsserver) = $resolvconf =~ m/^nameserver\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/m;
+    my ($domain) = $resolvconf =~ m/^domain\s+(\S+)$/m;
+
+    return {
+	default => $default,
+	ifaces => $ifaces,
+	gateway => $gateway,
+	dnsserver => $dnsserver,
+	domain => $domain,
+    }
+}
+
+sub display_message {
+    my ($msg) = @_;
+
+    my $dialog = Gtk3::MessageDialog->new($window, 'modal',
+					  'info', 'ok', $msg);
+    $dialog->run();
+    $dialog->destroy();
+}
+
+sub display_error {
+    my ($msg) = @_;
+
+    my $dialog = Gtk3::MessageDialog->new($window, 'modal',
+					  'error', 'ok', $msg);
+    $dialog->run();
+    $dialog->destroy();
+}
+
+my $ipconf_first_view = 1;
+
+sub create_ipconf_view {
+
+    cleanup_view();
+    display_html();
+
+    my $vbox =  Gtk3::VBox->new(0, 0);
+    $inbox->pack_start($vbox, 1, 0, 0);
+    my $hbox =  Gtk3::HBox->new(0, 0);
+    $vbox->pack_start($hbox, 0, 0, 10);
+    my $vbox2 =  Gtk3::VBox->new(0, 0);
+    $hbox->add($vbox2);
+
+    my $ipaddr_text = $config->{ipaddress} // "192.168.100.2";
+    my $ipbox;
+    ($ipbox, $ipconf_entry_addr) =
+	create_text_input($ipaddr_text, 'IP Address:');
+
+    my $netmask_text = $config->{netmask} // "255.255.255.0";
+    my $maskbox;
+    ($maskbox, $ipconf_entry_mask) =
+	create_text_input($netmask_text, 'Netmask:');
+
+    my $device_cb = Gtk3::ComboBoxText->new();
+    $device_cb->set_active(0);
+    $device_cb->set_visible(1);
+
+    my $get_device_desc = sub {
+	my $iface = shift;
+	return "$iface->{name} - $iface->{mac} ($iface->{driver})";
+    };
+
+    my $device_active_map = {};
+    my $device_active_reverse_map = {};
+
+    my $device_change_handler = sub {
+	my $current = shift;
+	$ipconf->{selected} = $device_active_map->{$current->get_active()};
+	my $iface = $ipconf->{ifaces}->{$ipconf->{selected}};
+	$config->{mngmt_nic} = $iface->{name};
+	$ipconf_entry_addr->set_text($iface->{inet}->{addr} || $iface->{inet6}->{addr})
+	    if $iface->{inet}->{addr} || $iface->{inet6}->{addr};
+	$ipconf_entry_mask->set_text($iface->{inet}->{mask} || $iface->{inet6}->{mask})
+	    if $iface->{inet}->{mask} || $iface->{inet6}->{mask};
+    };
+
+    my $i = 0;
+    foreach my $index (sort keys %{$ipconf->{ifaces}}) {
+	$device_cb->append_text(&$get_device_desc($ipconf->{ifaces}->{$index}));
+	$device_active_map->{$i} = $index;
+	$device_active_reverse_map->{$ipconf->{ifaces}->{$index}->{name}} = $i;
+	if ($ipconf_first_view && $index == $ipconf->{default}) {
+	    $device_cb->set_active($i);
+	    &$device_change_handler($device_cb);
+	    $ipconf_first_view = 0;
+	}
+	$device_cb->signal_connect('changed' => $device_change_handler);
+	$i++;
+    }
+
+    if (my $nic = $config->{mngmt_nic}) {
+	$device_cb->set_active($device_active_reverse_map->{$nic} // 0);
+    } else {
+	$device_cb->set_active(0);
+    }
+
+    my $devicebox = Gtk3::HBox->new(0, 0);
+    my $label = Gtk3::Label->new("Management Interface:");
+    $label->set_size_request(150, -1);
+    $label->set_alignment(1, 0.5);
+    $devicebox->pack_start($label, 0, 0, 10);
+    $devicebox->pack_start($device_cb, 0, 0, 0);
+
+    $vbox2->pack_start($devicebox, 0, 0, 2);
+
+    my $hn = $config->{fqdn} //  "$setup->{product}." . ($ipconf->{domain} // "example.invalid");
+
+    my ($hostbox, $hostentry) =
+	create_text_input($hn, 'Hostname (FQDN):');
+    $vbox2->pack_start($hostbox, 0, 0, 2);
+
+    $vbox2->pack_start($ipbox, 0, 0, 2);
+
+    $vbox2->pack_start($maskbox, 0, 0, 2);
+
+    $gateway = $config->{gateway} // $ipconf->{gateway} || '192.168.100.1';
+
+    my $gwbox;
+    ($gwbox, $ipconf_entry_gw) =
+	create_text_input($gateway, 'Gateway:');
+
+    $vbox2->pack_start($gwbox, 0, 0, 2);
+
+    $dnsserver = $config->{dnsserver} // $ipconf->{dnsserver} || $gateway;
+
+    my $dnsbox;
+    ($dnsbox, $ipconf_entry_dns) =
+	create_text_input($dnsserver, 'DNS Server:');
+
+    $vbox2->pack_start($dnsbox, 0, 0, 0);
+
+    $inbox->show_all;
+    set_next(undef, sub {
+
+	# verify hostname
+
+	my $text = $hostentry->get_text();
+
+	$text =~ s/^\s+//;
+	$text =~ s/\s+$//;
+
+	$config->{fqdn} = $text;
+
+	my $namere = "([a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)";
+
+	# Debian does not support purely numeric hostnames
+	if ($text && $text =~ /^[0-9]+(?:\.|$)/) {
+	    display_message("Purely numeric hostnames are not allowed.");
+	    $hostentry->grab_focus();
+	    return;
+	}
+
+	if ($text && $text =~ m/^(${namere}\.)*${namere}$/ && $text !~ m/.example.invalid$/ &&
+	    $text =~ m/^([^\.]+)\.(\S+)$/) {
+	    $hostname = $1;
+	    $domain = $2;
+	} else {
+	    display_message("Hostname does not look like a fully qualified domain name.");
+	    $hostentry->grab_focus();
+	    return;
+	}
+
+	# verify ip address
+
+	$text = $ipconf_entry_addr->get_text();
+	$text =~ s/^\s+//;
+	$text =~ s/\s+$//;
+	if ($text =~ m!^($IPV4RE)$!) {
+	    $ipaddress = $text;
+	    $ipversion = 4;
+	} elsif ($text =~ m!^($IPV6RE)$!) {
+	    $ipaddress = $text;
+	    $ipversion = 6;
+	} else {
+	    display_message("IP address is not valid.");
+	    $ipconf_entry_addr->grab_focus();
+	    return;
+	}
+	$config->{ipaddress} = $ipaddress;
+
+	$text = $ipconf_entry_mask->get_text();
+	$text =~ s/^\s+//;
+	$text =~ s/\s+$//;
+	if (($ipversion == 6) && ($text =~ m/^(\d+)$/) && ($1 >= 8) && ($1 <= 126)) {
+	    $netmask = $text;
+	} elsif (($ipversion == 4) && defined($ipv4_mask_hash->{$text})) {
+	    $netmask = $text;
+	} else {
+	    display_message("Netmask is not valid.");
+	    $ipconf_entry_mask->grab_focus();
+	    return;
+	}
+	$config->{netmask} = $netmask;
+
+	$text = $ipconf_entry_gw->get_text();
+	$text =~ s/^\s+//;
+	$text =~ s/\s+$//;
+	if (($ipversion == 4) && ($text =~ m!^($IPV4RE)$!)) {
+	    $gateway = $text;
+	} elsif (($ipversion == 6) && ($text =~ m!^($IPV6RE)$!)) {
+	    $gateway = $text;
+	} else {
+	    display_message("Gateway is not valid.");
+	    $ipconf_entry_gw->grab_focus();
+	    return;
+	}
+	$config->{gateway} = $gateway;
+
+	$text = $ipconf_entry_dns->get_text();
+	$text =~ s/^\s+//;
+	$text =~ s/\s+$//;
+	if (($ipversion == 4) && ($text =~ m!^($IPV4RE)$!)) {
+	    $dnsserver = $text;
+	} elsif (($ipversion == 6) && ($text =~ m!^($IPV6RE)$!)) {
+	    $dnsserver = $text;
+	} else {
+	    display_message("DNS server is not valid.");
+	    $ipconf_entry_dns->grab_focus();
+	    return;
+	}
+	$config->{dnsserver} = $dnsserver;
+
+	#print "TEST $ipaddress $netmask $gateway $dnsserver\n";
+
+	$step_number++;
+	create_ack_view();
+    });
+
+    $hostentry->grab_focus();
+}
+
+sub create_ack_view {
+
+    cleanup_view();
+
+    my $ack_template = "${proxmox_libdir}/html/ack_template.htm";
+    my $ack_html = "${proxmox_libdir}/html/$steps[$step_number]->{html}";
+    my $html_data = file_get_contents($ack_template);
+
+    my %config_values = (
+	__target_hd__ => join(' | ', @{$config_options->{target_hds}}),
+	__target_fs__ => $config_options->{filesys},
+	__country__ => $cmap->{country}->{$country}->{name},
+	__timezone__ => $timezone,
+	__keymap__ => $keymap,
+	__mailto__ => $mailto,
+	__interface__ => $ipconf->{ifaces}->{$ipconf->{selected}}->{name},
+	__hostname__ => $hostname,
+	__ip__ => $ipaddress,
+	__netmask__ => $netmask,
+	__gateway__ => $gateway,
+	__dnsserver__ => $dnsserver,
+    );
+
+    while ( my ($k, $v) = each %config_values) {
+	$html_data =~ s/$k/$v/g;
+    }
+
+    write_config($html_data, $ack_html);
+
+    display_html();
+
+    set_next(undef, sub {
+	$step_number++;
+	create_extract_view();
+    });
+}
+
+sub get_device_desc {
+    my ($devname, $size, $model) = @_;
+
+    if ($size && ($size > 0)) {
+	$size = int($size/2048); # size in MB, from 512B "sectors"
+
+	my $text = "$devname (";
+	if ($size >= 1024) {
+	    $size = int($size/1024); # size in GB
+	    $text .= "${size}GB";
+	} else {
+	    $text .= "${size}MB";
+	}
+
+	$text .= ", $model" if $model;
+	$text .= ")";
+
+    } else {
+	return $devname;
+    }
+}
+
+sub update_layout {
+    my ($cb, $kmap) = @_;
+
+    my $ind;
+    my $def;
+    my $i = 0;
+    my $kmaphash = $cmap->{kmaphash};
+    foreach my $layout (sort keys %$kmaphash) {
+	$def = $i if $kmaphash->{$layout} eq 'en-us';
+	$ind = $i if $kmap && $kmaphash->{$layout} eq $kmap;
+	$i++;
+    }
+
+    $cb->set_active($ind || $def || 0);
+}
+
+my $lastzonecb;
+sub update_zonelist {
+    my ($box, $cc) = @_;
+
+    my $cczones = $cmap->{cczones};
+    my $zones = $cmap->{zones};
+
+    my $sel;
+    if ($lastzonecb) {
+	$sel = $lastzonecb->get_active_text();
+	$box->remove ($lastzonecb);
+    } else {
+	$sel = $timezone; # used once to select default
+    }
+
+    my $cb = $lastzonecb = Gtk3::ComboBoxText->new();
+    $cb->set_size_request(200, -1);
+
+    $cb->signal_connect('changed' => sub {
+	$timezone = $cb->get_active_text();
+    });
+
+    my @za;
+    if ($cc && defined ($cczones->{$cc})) {
+	@za = keys %{$cczones->{$cc}};
+    } else {
+	@za = keys %$zones;
+    }
+    my $ind;
+    my $i = 0;
+    foreach my $zone (sort @za) {
+	$ind = $i if $sel && $zone eq $sel;
+	$cb->append_text($zone);
+	$i++;
+    }
+
+    $cb->set_active($ind || 0);
+
+    $cb->show;
+    $box->pack_start($cb, 0, 0, 0);
+}
+
+sub create_password_view {
+
+    cleanup_view();
+
+    my $vbox2 =  Gtk3::VBox->new(0, 0);
+    $inbox->pack_start($vbox2, 1, 0, 0);
+    my $vbox =  Gtk3::VBox->new(0, 0);
+    $vbox2->pack_start($vbox, 0, 0, 10);
+
+    my $hbox1 = Gtk3::HBox->new(0, 0);
+    my $label = Gtk3::Label->new("Password");
+    $label->set_size_request(150, -1);
+    $label->set_alignment(1, 0.5);
+    $hbox1->pack_start($label, 0, 0, 10);
+    my $pwe1 = Gtk3::Entry->new();
+    $pwe1->set_visibility(0);
+    $pwe1->set_text($password) if $password;
+    $pwe1->set_size_request(200, -1);
+    $hbox1->pack_start($pwe1, 0, 0, 0);
+
+    my $hbox2 = Gtk3::HBox->new(0, 0);
+    $label = Gtk3::Label->new("Confirm");
+    $label->set_size_request(150, -1);
+    $label->set_alignment(1, 0.5);
+    $hbox2->pack_start($label, 0, 0, 10);
+    my $pwe2 = Gtk3::Entry->new();
+    $pwe2->set_visibility(0);
+    $pwe2->set_text($password) if $password;
+    $pwe2->set_size_request(200, -1);
+    $hbox2->pack_start($pwe2, 0, 0, 0);
+
+    my $hbox3 = Gtk3::HBox->new(0, 0);
+    $label = Gtk3::Label->new("E-Mail");
+    $label->set_size_request(150, -1);
+    $label->set_alignment(1, 0.5);
+    $hbox3->pack_start($label, 0, 0, 10);
+    my $eme = Gtk3::Entry->new();
+    $eme->set_size_request(200, -1);
+    $eme->set_text($mailto);
+    $hbox3->pack_start($eme, 0, 0, 0);
+
+
+    $vbox->pack_start($hbox1, 0, 0, 5);
+    $vbox->pack_start($hbox2, 0, 0, 5);
+    $vbox->pack_start($hbox3, 0, 0, 15);
+
+    $inbox->show_all;
+
+    display_html();
+
+    set_next (undef,  sub {
+
+	my $t1 = $pwe1->get_text;
+	my $t2 = $pwe2->get_text;
+
+	if (length ($t1) < 5) {
+	    display_message("Password is too short.");
+	    $pwe1->grab_focus();
+	    return;
+	}
+
+	if ($t1 ne $t2) {
+	    display_message("Password does not match.");
+	    $pwe1->grab_focus();
+	    return;
+	}
+
+	my $t3 = $eme->get_text;
+	if ($t3 !~ m/^\S+\@\S+\.\S+$/) {
+	    display_message("E-Mail does not look like a valid address" .
+			     " (user\@domain.tld)");
+	    $eme->grab_focus();
+	    return;
+	}
+
+	if ($t3 eq 'mail@example.invalid') {
+	    display_message("Please enter a valid E-Mail address");
+	    $eme->grab_focus();
+	    return;
+	}
+
+	$password = $t1;
+	$mailto = $t3;
+
+	$step_number++;
+	create_ipconf_view();
+    });
+
+    $pwe1->grab_focus();
+
+}
+
+sub create_country_view {
+
+    cleanup_view();
+
+    my $countryhash = $cmap->{countryhash};
+    my $ctr = $cmap->{country};
+
+    my $vbox2 =  Gtk3::VBox->new(0, 0);
+    $inbox->pack_start($vbox2, 1, 0, 0);
+    my $vbox =  Gtk3::VBox->new(0, 0);
+    $vbox2->pack_start($vbox, 0, 0, 10);
+
+    my $w = Gtk3::Entry->new();
+    $w->set_size_request(200, -1);
+
+    my $c = Gtk3::EntryCompletion->new();
+    $c->set_text_column(0);
+    $c->set_minimum_key_length(0);
+    $c->set_popup_set_width(1);
+    $c->set_inline_completion(1);
+
+    my $hbox2 = Gtk3::HBox->new(0, 0);
+    my $label = Gtk3::Label->new("Time zone");
+    $label->set_size_request(150, -1);
+    $label->set_alignment(1, 0.5);
+    $hbox2->pack_start($label, 0, 0, 10);
+    update_zonelist ($hbox2);
+
+    my $hbox3 = Gtk3::HBox->new(0, 0);
+    $label = Gtk3::Label->new("Keyboard Layout");
+    $label->set_size_request(150, -1);
+    $label->set_alignment(1, 0.5);
+    $hbox3->pack_start($label, 0, 0, 10);
+
+    my $kmapcb = Gtk3::ComboBoxText->new();
+    $kmapcb->set_size_request (200, -1);
+    foreach my $layout (sort keys %{$cmap->{kmaphash}}) {
+	$kmapcb->append_text ($layout);
+    }
+
+    update_layout($kmapcb);
+    $hbox3->pack_start ($kmapcb, 0, 0, 0);
+
+    $kmapcb->signal_connect ('changed' => sub {
+	my $sel = $kmapcb->get_active_text();
+	if (my $kmap = $cmap->{kmaphash}->{$sel}) {
+	    my $xkmap = $cmap->{kmap}->{$kmap}->{x11};
+	    my $xvar = $cmap->{kmap}->{$kmap}->{x11var};
+	    syscmd ("setxkbmap $xkmap $xvar") if !$opt_testmode;
+	    $keymap = $kmap;
+	}
+    });
+
+    $w->signal_connect ('changed' => sub {
+	my ($entry, $event) = @_;
+	my $text = $entry->get_text;
+
+	if (my $cc = $countryhash->{lc($text)}) {
+	    update_zonelist($hbox2, $cc);
+	    my $kmap = $ctr->{$cc}->{kmap} || 'en-us';
+	    update_layout($kmapcb, $kmap);
+	}
+    });
+
+    $w->signal_connect (key_press_event => sub {
+	my ($entry, $event) = @_;
+	my $text = $entry->get_text;
+
+	my $val = $event->get_keyval;
+
+	if ($val == Gtk3::Gdk::KEY_Tab) {
+	    my $cc = $countryhash->{lc($text)};
+
+	    my $found = 0;
+	    my $compl;
+
+	    if ($cc) {
+		$found = 1;
+		$compl = $ctr->{$cc}->{name};
+	    } else {
+		foreach my $cc (keys %$ctr) {
+		    my $ct = $ctr->{$cc}->{name};
+		    if ($ct =~ m/^\Q$text\E.*$/i) {
+			$found++;
+			$compl = $ct;
+		    }
+		    last if $found > 1;
+		}
+	    }
+
+	    if ($found == 1) {
+		$entry->set_text($compl);
+		$c->complete();
+		return undef;
+	    } else {
+		#Gtk3::Gdk::beep();
+		print chr(7); # beep ?
+	    }
+
+	    $c->complete();
+
+	    my $buf = $w->get_buffer();
+	    $buf->insert_text(-1, '', -1); # popup selection
+
+	    return 1;
+	}
+
+	return undef;
+    });
+
+    my $ls = Gtk3::ListStore->new('Glib::String');
+    foreach my $cc (sort {$ctr->{$a}->{name} cmp $ctr->{$b}->{name} } keys %$ctr) {
+	my $iter = $ls->append();
+	$ls->set ($iter, 0, $ctr->{$cc}->{name});
+    }
+    $c->set_model ($ls);
+
+    $w->set_completion ($c);
+
+    my $hbox =  Gtk3::HBox->new(0, 0);
+
+    $label = Gtk3::Label->new("Country");
+    $label->set_alignment(1, 0.5);
+    $label->set_size_request(150, -1);
+    $hbox->pack_start($label, 0, 0, 10);
+    $hbox->pack_start($w, 0, 0, 0);
+
+    $vbox->pack_start($hbox, 0, 0, 5);
+    $vbox->pack_start($hbox2, 0, 0, 5);
+    $vbox->pack_start($hbox3, 0, 0, 5);
+
+    if ($country && $ctr->{$country}) {
+	$w->set_text ($ctr->{$country}->{name});
+    }
+
+    $inbox->show_all;
+
+    display_html();
+    set_next (undef,  sub {
+
+	my $text = $w->get_text;
+
+	if (my $cc = $countryhash->{lc($text)}) {
+	    $country = $cc;
+	    $step_number++;
+	    create_password_view();
+	    return;
+	} else {
+	    display_message("Please select a country first.");
+	    $w->grab_focus();
+	}
+    });
+
+    $w->grab_focus();
+}
+
+my $target_hd_combo;
+my $target_hd_label;
+
+my $hdoption_first_setup = 1;
+
+my $create_basic_grid = sub {
+    my $grid =  Gtk3::Grid->new();
+    $grid->set_visible(1);
+    $grid->set_column_spacing(10);
+    $grid->set_row_spacing(10);
+    $grid->set_hexpand(1);
+
+    $grid->set_margin_start(5);
+    $grid->set_margin_end(5);
+    $grid->set_margin_top(5);
+    $grid->set_margin_bottom(5);
+
+    return $grid;
+};
+
+my $create_label_widget_grid = sub {
+    my ($labeled_widgets) = @_;
+
+    my $grid = &$create_basic_grid();
+    my $row = 0;
+
+    for (my $i = 0; $i < @$labeled_widgets; $i += 2) {
+	my $widget = @$labeled_widgets[$i+1];
+	my $label = Gtk3::Label->new(@$labeled_widgets[$i]);
+	$label->set_visible(1);
+	$label->set_alignment (1, 0.5);
+	$grid->attach($label, 0, $row, 1, 1);
+	$widget->set_visible(1);
+	$grid->attach($widget, 1, $row, 1, 1);
+	$row++;
+    }
+
+    return $grid;
+};
+
+my $create_raid_disk_grid = sub {
+    my $disk_labeled_widgets = [];
+    for (my $i = 0; $i < @$hds; $i++) {
+	my $disk_selector = Gtk3::ComboBoxText->new();
+	$disk_selector->append_text("-- do not use --");
+	$disk_selector->set_active(0);
+	$disk_selector->set_visible(1);
+	foreach my $hd (@$hds) {
+	    my ($disk, $devname, $size, $model) = @$hd;
+	    $disk_selector->append_text(get_device_desc ($devname, $size, $model));
+	    $disk_selector->{pve_disk_id} = $i;
+	    $disk_selector->signal_connect (changed => sub {
+		my $w = shift;
+		my $diskid = $w->{pve_disk_id};
+		my $a = $w->get_active - 1;
+		$config_options->{"disksel${diskid}"} = ($a >= 0) ? $hds->[$a] : undef;
+	    });
+	}
+
+	if ($hdoption_first_setup) {
+	    $disk_selector->set_active ($i+1) if $hds->[$i];
+	} else {
+	    my $hdind = 0;
+	    if (my $cur_hd = $config_options->{"disksel$i"}) {
+		foreach my $hd (@$hds) {
+		    if (@$hd[1] eq @$cur_hd[1]) {
+			$disk_selector->set_active($hdind+1);
+			last;
+		    }
+		    $hdind++;
+		}
+	    }
+	}
+
+	push @$disk_labeled_widgets, "Harddisk $i", $disk_selector;
+    }
+
+    my $scrolled_window = Gtk3::ScrolledWindow->new();
+    $scrolled_window->set_hexpand(1);
+    $scrolled_window->set_propagate_natural_height(1) if @$hds > 4;
+    $scrolled_window->add(&$create_label_widget_grid($disk_labeled_widgets));
+    $scrolled_window->set_policy('never', 'automatic');
+
+    return $scrolled_window;
+#    &$create_label_widget_grid($disk_labeled_widgets)
+};
+
+# shared between different ui parts (e.g., ZFS and "normal" single disk FS)
+my $hdsize_size_adj;
+my $hdsize_entry_buffer;
+
+my $get_hdsize_spinbtn = sub {
+    my $hdsize = shift;
+
+    $hdsize_entry_buffer //= Gtk3::EntryBuffer->new(undef, 1);
+
+    if (defined($hdsize)) {
+	$hdsize_size_adj = Gtk3::Adjustment->new($config_options->{hdsize} || $hdsize, 0, $hdsize+1, 1, 1, 1);
+    } else {
+	die "called get_hdsize_spinbtn with \$hdsize_size_adj not defined but did not pass hdsize!\n"
+	    if !defined($hdsize_size_adj);
+    }
+
+    my $spinbutton_hdsize = Gtk3::SpinButton->new($hdsize_size_adj, 1, 1);
+    $spinbutton_hdsize->set_buffer($hdsize_entry_buffer);
+    $spinbutton_hdsize->set_adjustment($hdsize_size_adj);
+    $spinbutton_hdsize->set_tooltip_text("only use specified size (GB) of the harddisk (rest left unpartitioned)");
+    return $spinbutton_hdsize;
+};
+
+my $create_raid_advanced_grid = sub {
+    my $labeled_widgets = [];
+    my $spinbutton_ashift = Gtk3::SpinButton->new_with_range(9,13,1);
+    $spinbutton_ashift->set_tooltip_text("zpool ashift property (pool sector size, default 2^12)");
+    $spinbutton_ashift->signal_connect ("value-changed" => sub {
+	my $w = shift;
+	$config_options->{ashift} = $w->get_value_as_int();
+    });
+    $config_options->{ashift} = 12 if ! defined($config_options->{ashift});
+    $spinbutton_ashift->set_value($config_options->{ashift});
+    push @$labeled_widgets, "ashift";
+    push @$labeled_widgets, $spinbutton_ashift;
+
+    my $combo_compress = Gtk3::ComboBoxText->new();
+    $combo_compress->set_tooltip_text("zfs compression algorithm for rpool dataset");
+    # note: gzip / lze not allowed for bootfs vdevs
+    my $comp_opts = ["on","off","lzjb","lz4"];
+    foreach my $opt (@$comp_opts) {
+	$combo_compress->append($opt, $opt);
+    }
+    $config_options->{compress} = "on" if !defined($config_options->{compress});
+    $combo_compress->set_active_id($config_options->{compress});
+    $combo_compress->signal_connect (changed => sub {
+	my $w = shift;
+	$config_options->{compress} = $w->get_active_text();
+    });
+    push @$labeled_widgets, "compress";
+    push @$labeled_widgets, $combo_compress;
+
+    my $combo_checksum = Gtk3::ComboBoxText->new();
+    $combo_checksum->set_tooltip_text("zfs checksum algorithm for rpool dataset");
+    my $csum_opts = ["on", "off","fletcher2", "fletcher4", "sha256"];
+    foreach my $opt (@$csum_opts) {
+	$combo_checksum->append($opt, $opt);
+    }
+    $config_options->{checksum} = "on" if !($config_options->{checksum});
+    $combo_checksum->set_active_id($config_options->{checksum});
+    $combo_checksum->signal_connect (changed => sub {
+	my $w = shift;
+	$config_options->{checksum} = $w->get_active_text();
+    });
+    push @$labeled_widgets, "checksum";
+    push @$labeled_widgets, $combo_checksum;
+
+    my $spinbutton_copies = Gtk3::SpinButton->new_with_range(1,3,1);
+    $spinbutton_copies->set_tooltip_text("zfs copies property for rpool dataset (in addition to RAID redundancy!)");
+    $spinbutton_copies->signal_connect ("value-changed" => sub {
+	my $w = shift;
+	$config_options->{copies} = $w->get_value_as_int();
+    });
+    $config_options->{copies} = 1 if !defined($config_options->{copies});
+    $spinbutton_copies->set_value($config_options->{copies});
+    push @$labeled_widgets, "copies", $spinbutton_copies;
+
+    push @$labeled_widgets, "hdsize", $get_hdsize_spinbtn->();
+    return &$create_label_widget_grid($labeled_widgets);;
+};
+
+sub create_hdoption_view {
+
+    my $dialog = Gtk3::Dialog->new();
+
+    $dialog->set_title("Harddisk options");
+
+    $dialog->add_button("_OK", 1);
+
+    my $contarea = $dialog->get_content_area();
+
+    my $hbox2 =  Gtk3::Box->new('horizontal', 0);
+    $contarea->pack_start($hbox2, 1, 1, 10);
+
+    my $grid =  Gtk3::Grid->new();
+    $grid->set_column_spacing(10);
+    $grid->set_row_spacing(10);
+
+    $hbox2->pack_start($grid, 1, 0, 10);
+
+    my $row = 0;
+
+    # Filesystem type
+
+    my $label0 = Gtk3::Label->new("Filesystem");
+    $label0->set_alignment (1, 0.5);
+    $grid->attach($label0, 0, $row, 1, 1);
+
+    my $fstypecb = Gtk3::ComboBoxText->new();
+
+    my $fstype = ['ext3', 'ext4', 'xfs',
+		  'zfs (RAID0)', 'zfs (RAID1)',
+		  'zfs (RAID10)', 'zfs (RAIDZ-1)',
+		  'zfs (RAIDZ-2)', 'zfs (RAIDZ-3)'];
+
+    push @$fstype, 'btrfs (RAID0)', 'btrfs (RAID1)', 'btrfs (RAID10)'
+	if $setup->{enable_btrfs};
+
+    my $tcount = 0;
+    foreach my $tmp (@$fstype) {
+	$fstypecb->append_text($tmp);
+	$fstypecb->set_active ($tcount)
+	    if $config_options->{filesys} eq $tmp;
+	$tcount++;
+    }
+
+    $grid->attach($fstypecb, 1, $row, 1, 1);
+
+    $hbox2->show_all();
+
+    $row++;
+
+    my $sep = Gtk3::HSeparator->new();
+    $sep->set_visible(1);
+    $grid->attach($sep, 0, $row, 2, 1);
+    $row++;
+
+    my $hdsize_labeled_widgets = [];
+
+    # size compute
+    my $hdsize = 0;
+    if ( -b $target_hd) {
+	$hdsize = int(hd_size ($target_hd) / (1024*1024.0)); # size in GB
+    } elsif ($target_hd) {
+	$hdsize = int((-s $target_hd) / (1024*1024*1024.0));
+    }
+
+    my $spinbutton_hdsize = $get_hdsize_spinbtn->($hdsize);
+    push @$hdsize_labeled_widgets, "hdsize", $spinbutton_hdsize;
+
+    my $entry_swapsize = Gtk3::Entry->new();
+    $entry_swapsize->set_tooltip_text("maximum SWAP size (GB)");
+    $entry_swapsize->signal_connect (key_press_event => \&check_float);
+    $entry_swapsize->set_text($config_options->{swapsize}) if defined($config_options->{swapsize});
+    push @$hdsize_labeled_widgets, "swapsize", $entry_swapsize;
+
+    my $entry_maxroot = Gtk3::Entry->new();
+    if ($setup->{product} eq 'pve') {
+	$entry_maxroot->set_tooltip_text("maximum size (GB) for LVM root volume");
+	$entry_maxroot->signal_connect (key_press_event => \&check_float);
+	$entry_maxroot->set_text($config_options->{maxroot}) if $config_options->{maxroot};
+	push @$hdsize_labeled_widgets, "maxroot", $entry_maxroot;
+    }
+
+    my $entry_minfree = Gtk3::Entry->new();
+    $entry_minfree->set_tooltip_text("minimum free LVM space (GB, required for LVM snapshots)");
+    $entry_minfree->signal_connect (key_press_event => \&check_float);
+    $entry_minfree->set_text($config_options->{minfree}) if defined($config_options->{minfree});
+    push @$hdsize_labeled_widgets, "minfree", $entry_minfree;
+
+    my $entry_maxvz;
+    if ($setup->{product} eq 'pve') {
+	$entry_maxvz = Gtk3::Entry->new();
+	$entry_maxvz->set_tooltip_text("maximum size (GB) for LVM data volume");
+	$entry_maxvz->signal_connect (key_press_event => \&check_float);
+	$entry_maxvz->set_text($config_options->{maxvz}) if defined($config_options->{maxvz});
+	push @$hdsize_labeled_widgets, "maxvz", $entry_maxvz;
+    }
+
+    my $options_stack = Gtk3::Stack->new();
+    $options_stack->set_visible(1);
+    $options_stack->set_hexpand(1);
+    $options_stack->set_vexpand(1);
+    $options_stack->add_titled(&$create_raid_disk_grid(), "raiddisk", "Disk Setup");
+    $options_stack->add_titled(&$create_label_widget_grid($hdsize_labeled_widgets), "hdsize", "Size Options");
+    $options_stack->add_titled(&$create_raid_advanced_grid("zfs"), "raidzfsadvanced", "Advanced Options");
+    $options_stack->set_visible_child_name("raiddisk");
+    my $options_stack_switcher = Gtk3::StackSwitcher->new();
+    $options_stack_switcher->set_halign('center');
+    $options_stack_switcher->set_stack($options_stack);
+    $grid->attach($options_stack_switcher, 0, $row, 2, 1);
+    $row++;
+    $grid->attach($options_stack, 0, $row, 2, 1);
+    $row++;
+
+    $hdoption_first_setup = 0;
+
+    my $switch_view = sub {
+	my $raid = $config_options->{filesys} =~ m/zfs|btrfs/;
+	my $enable_zfs_opts = $config_options->{filesys} =~ m/zfs/;
+
+	$target_hd_combo->set_visible(!$raid);
+	$options_stack->get_child_by_name("hdsize")->set_visible(!$raid);
+	$options_stack->get_child_by_name("raiddisk")->set_visible($raid);
+	$options_stack_switcher->set_visible($enable_zfs_opts);
+	$options_stack->get_child_by_name("raidzfsadvanced")->set_visible($enable_zfs_opts);
+	if ($raid) {
+	    $target_hd_label->set_text("Target: $config_options->{filesys} ");
+	    $options_stack->set_visible_child_name("raiddisk");
+	} else {
+	    $target_hd_label->set_text("Target Harddisk: ");
+	}
+	my (undef, $pref_width) = $dialog->get_preferred_width();
+	my (undef, $pref_height) = $dialog->get_preferred_height();
+	$pref_height = 750 if $pref_height > 750;
+	$dialog->resize($pref_width, $pref_height);
+    };
+
+    &$switch_view();
+
+    $fstypecb->signal_connect (changed => sub {
+	$config_options->{filesys} = $fstypecb->get_active_text();
+	&$switch_view();
+    });
+
+    $dialog->show();
+
+    $dialog->run();
+
+    my $get_float = sub {
+	my ($entry) = @_;
+
+	my $text = $entry->get_text();
+	return undef if !defined($text);
+
+	$text =~ s/^\s+//;
+	$text =~ s/\s+$//;
+
+	return undef if $text !~ m/^\d+(\.\d+)?$/;
+
+	return $text;
+    };
+
+    my $tmp;
+
+    if (($tmp = &$get_float($spinbutton_hdsize)) && ($tmp != $hdsize)) {
+	$config_options->{hdsize} = $tmp;
+    } else {
+	delete $config_options->{hdsize};
+    }
+
+    if (defined($tmp = &$get_float($entry_swapsize))) {
+	$config_options->{swapsize} = $tmp;
+    } else {
+	delete $config_options->{swapsize};
+    }
+
+    if (defined($tmp = &$get_float($entry_maxroot))) {
+	$config_options->{maxroot} = $tmp;
+    } else {
+	delete $config_options->{maxroot};
+    }
+
+    if (defined($tmp = &$get_float($entry_minfree))) {
+	$config_options->{minfree} = $tmp;
+    } else {
+	delete $config_options->{minfree};
+    }
+
+    if ($entry_maxvz && defined($tmp = &$get_float($entry_maxvz))) {
+	$config_options->{maxvz} = $tmp;
+    } else {
+	delete $config_options->{maxvz};
+    }
+
+    $dialog->destroy();
+}
+
+my $get_raid_devlist = sub {
+
+    my $dev_name_hash = {};
+
+    my $devlist = [];
+    for (my $i = 0; $i < @$hds; $i++) {
+	if (my $hd = $config_options->{"disksel$i"}) {
+	    my ($disk, $devname, $size, $model) = @$hd;
+	    die "device '$devname' is used more than once\n"
+		if $dev_name_hash->{$devname};
+	    $dev_name_hash->{$devname} = $hd;
+	    push @$devlist, $hd;
+	}
+    }
+
+    return $devlist;
+};
+
+sub zfs_mirror_size_check {
+    my ($expected, $actual) = @_;
+
+    die "mirrored disks must have same size\n"
+	if abs($expected - $actual) > $expected / 10;
+}
+
+sub get_zfs_raid_setup {
+
+    my $filesys = $config_options->{filesys};
+
+    my $devlist = &$get_raid_devlist();
+
+    my $diskcount = scalar(@$devlist);
+    die "$filesys needs at least one device\n" if $diskcount < 1;
+
+    my $bootdevlist = [];
+
+    my $cmd= '';
+    if ($filesys eq 'zfs (RAID0)') {
+	push @$bootdevlist, @$devlist[0];
+	foreach my $hd (@$devlist) {
+	    $cmd .= " @$hd[1]";
+	}
+    } elsif ($filesys eq 'zfs (RAID1)') {
+	die "zfs (RAID1) needs at least 2 device\n" if $diskcount < 2;
+	$cmd .= ' mirror ';
+	my $hd = @$devlist[0];
+	my $expected_size = @$hd[2]; # all disks need approximately same size
+	foreach $hd (@$devlist) {
+	    zfs_mirror_size_check($expected_size, @$hd[2]);
+	    $cmd .= " @$hd[1]";
+	    push @$bootdevlist, $hd;
+	}
+    } elsif ($filesys eq 'zfs (RAID10)') {
+	die "zfs (RAID10) needs at least 4 device\n" if $diskcount < 4;
+	die "zfs (RAID10) needs an even number of devices\n" if $diskcount & 1;
+
+	push @$bootdevlist, @$devlist[0], @$devlist[1];
+
+	for (my $i = 0; $i < $diskcount; $i+=2) {
+	    my $hd1 = @$devlist[$i];
+	    my $hd2 = @$devlist[$i+1];
+	    zfs_mirror_size_check(@$hd1[2], @$hd2[2]); # pairs need approximately same size
+	    $cmd .= ' mirror ' . @$hd1[1] . ' ' . @$hd2[1];
+	}
+
+    } elsif ($filesys =~ m/^zfs \(RAIDZ-([123])\)$/) {
+	my $level = $1;
+	my $mindisks = 2 + $level;
+	die "zfs (RAIDZ-$level) needs at least $mindisks devices\n" if scalar(@$devlist) < $mindisks;
+	my $hd = @$devlist[0];
+	my $expected_size = @$hd[2]; # all disks need approximately same size
+	$cmd .= " raidz$level";
+	foreach $hd (@$devlist) {
+	    zfs_mirror_size_check($expected_size, @$hd[2]);
+	    $cmd .= " @$hd[1]";
+	    push @$bootdevlist, $hd;
+	}
+    } else {
+	die "unknown zfs mode '$filesys'\n";
+    }
+
+    return ($devlist, $bootdevlist, $cmd);
+}
+
+sub get_btrfs_raid_setup {
+
+    my $filesys = $config_options->{filesys};
+
+    my $devlist = &$get_raid_devlist();
+
+    my $diskcount = scalar(@$devlist);
+    die "$filesys needs at least one device\n" if $diskcount < 1;
+
+    my $mode;
+
+    if ($diskcount == 1) {
+	$mode = 'single';
+    } else {
+	if ($filesys eq 'btrfs (RAID0)') {
+	    $mode = 'raid0';
+	} elsif ($filesys eq 'btrfs (RAID1)') {
+	    die "btrfs (RAID1) needs at least 2 device\n" if $diskcount < 2;
+	    $mode = 'raid1';
+	} elsif ($filesys eq 'btrfs (RAID10)') {
+	    die "btrfs (RAID10) needs at least 4 device\n" if $diskcount < 4;
+	    $mode = 'raid10';
+	} else {
+	    die "unknown btrfs mode '$filesys'\n";
+	}
+    }
+
+    return ($devlist, $mode);
+}
+
+my $last_hd_selected = 0;
+sub create_hdsel_view {
+
+    $prev_btn->set_sensitive(1); # enable previous button at this point
+
+    cleanup_view();
+
+    my $vbox =  Gtk3::VBox->new(0, 0);
+    $inbox->pack_start($vbox, 1, 0, 0);
+    my $hbox =  Gtk3::HBox->new(0, 0);
+    $vbox->pack_start($hbox, 0, 0, 10);
+
+    my ($disk, $devname, $size, $model) = @{@$hds[0]};
+    $target_hd = $devname if !defined($target_hd);
+
+    $target_hd_label = Gtk3::Label->new("Target Harddisk: ");
+    $hbox->pack_start($target_hd_label, 0, 0, 0);
+
+    $target_hd_combo = Gtk3::ComboBoxText->new();
+
+    foreach my $hd (@$hds) {
+	($disk, $devname, $size, $model) = @$hd;
+	$target_hd_combo->append_text (get_device_desc($devname, $size, $model));
+    }
+
+    my $raid = $config_options->{filesys} =~ m/zfs|btrfs/;
+    if ($raid) {
+	$target_hd_label->set_text("Target: $config_options->{filesys} ");
+	$target_hd_combo->set_visible(0);
+	$target_hd_combo->set_no_show_all(1);
+    }
+    $target_hd_combo->set_active($last_hd_selected);
+    $target_hd_combo->signal_connect(changed => sub {
+	$a = shift->get_active;
+	my ($disk, $devname) = @{@$hds[$a]};
+	$last_hd_selected = $a;
+	$target_hd = $devname;
+    });
+
+    $hbox->pack_start($target_hd_combo, 0, 0, 10);
+
+    my $options = Gtk3::Button->new('_Options');
+    $options->signal_connect (clicked => \&create_hdoption_view);
+    $hbox->pack_start ($options, 0, 0, 0);
+
+
+    $inbox->show_all;
+
+    display_html();
+
+    set_next(undef, sub {
+
+	if ($config_options->{filesys} =~ m/zfs/) {
+	    my ($devlist) = eval { get_zfs_raid_setup() };
+	    if (my $err = $@) {
+		display_message("Warning: $err\nPlease fix ZFS setup first.");
+		return;
+	    }
+	    $config_options->{target_hds} = [ map { $_->[1] } @$devlist ];
+	} elsif ($config_options->{filesys} =~ m/btrfs/) {
+	    my ($devlist) = eval { get_btrfs_raid_setup() };
+	    if (my $err = $@) {
+		display_message("Warning: $err\nPlease fix BTRFS setup first.");
+		return;
+	    }
+	    $config_options->{target_hds} = [ map { $_->[1] } @$devlist ];
+	} else {
+	    $config_options->{target_hds} = [ $target_hd ];
+	}
+
+	$step_number++;
+	create_country_view();
+    });
+}
+
+sub create_extract_view {
+
+    cleanup_view();
+
+    display_info();
+
+    $next->set_sensitive(0);
+    $prev_btn->set_sensitive(0);
+    $prev_btn->hide();
+
+    my $vbox =  Gtk3::VBox->new(0, 0);
+    $inbox->pack_start ($vbox, 1, 0, 0);
+    my $hbox =  Gtk3::HBox->new(0, 0);
+    $vbox->pack_start ($hbox, 0, 0, 10);
+
+    my $vbox2 =  Gtk3::VBox->new(0, 0);
+    $hbox->pack_start ($vbox2, 0, 0, 0);
+
+    $progress_status = Gtk3::Label->new('');
+    $vbox2->pack_start ($progress_status, 1, 1, 0);
+
+    $progress = Gtk3::ProgressBar->new;
+    $progress->set_show_text(1);
+    $progress->set_size_request (600, -1);
+
+    $vbox2->pack_start($progress, 0, 0, 0);
+
+    $inbox->show_all();
+
+    my $tdir = $opt_testmode ? "target" : "/target";
+    mkdir $tdir;
+    my $base = "${proxmox_cddir}/$setup->{product}-base.squashfs";
+
+    eval  { extract_data($base, $tdir); };
+    my $err = $@;
+
+    $next->set_sensitive(1);
+
+    set_next("_Reboot", sub { exit (0); } );
+
+    if ($err) {
+	display_html("fail.htm");
+	display_error($err);
+    } else {
+	cleanup_view();
+	display_html("success.htm");
+    }
+}
+
+sub create_intro_view {
+
+    $prev_btn->set_sensitive(0);
+
+    cleanup_view();
+
+    if ($setup->{product} eq 'pve') {
+	eval {
+	    my $cpuinfo = file_get_contents('/proc/cpuinfo');
+	    if ($cpuinfo && !($cpuinfo =~ /^flags\s*:.*(vmx|svm)/m)) {
+		display_error("No support for KVM virtualisation detected.\n\n" .
+			      "Check BIOS settings for Intel VT / AMD-V / SVM.")
+	    }
+	};
+    }
+
+    display_html();
+
+    $step_number++;
+    set_next("I a_gree", \&create_hdsel_view);
+}
+
+$ipconf = get_ip_config();
+
+$country = detect_country() if $ipconf->{default} || $opt_testmode;
+
+# read country, kmap and timezone infos
+$cmap = read_cmap();
+
+if (!defined($cmap->{country}->{$country})) {
+    print $logfd "ignoring detected country '$country', invalid or unknown\n";
+    $country = undef;
+}
+
+create_main_window ();
+
+my $initial_error = 0;
+
+if (!defined ($hds) || (scalar (@$hds) <= 0)) {
+    print "no hardisks found\n";
+    $initial_error = 1;
+    display_html("nohds.htm");
+    set_next("Reboot", sub { exit(0); } );
+} else {
+    foreach my $hd (@$hds) {
+	my ($disk, $devname) = @$hd;
+	next if $devname =~ m|^/dev/md\d+$|;
+	print "found Disk$disk N:$devname\n";
+    }
+}
+
+if (!$initial_error && (scalar keys %{ $ipconf->{ifaces} } == 0)) {
+    print "no network interfaces found\n";
+    $initial_error = 1;
+    display_html("nonics.htm");
+    set_next("Reboot", sub { exit(0); } );
+}
+
+create_intro_view () if !$initial_error;
+
+Gtk3->main;
+
+exit 0;
